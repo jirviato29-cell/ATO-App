@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,7 @@ ROLES_ADMIN = (models.RolEnum.admin, models.RolEnum.direccion)
 # se crean ni se modifican.
 #
 # Acceso: /hoy y /dia para cualquier usuario (venta y nivel del modulo).
+# /mi-avance para cualquier usuario con modulo: solo su modulo y su propia fila.
 # /asesores y /semana solo admin y direccion: exponen lo que cobra cada asesor.
 # /config solo admin.
 #
@@ -94,6 +95,71 @@ def metas_dia(
     current_user: models.Usuario = Depends(get_current_user),
 ):
     return _bolsa_dia(db, current_user, fecha or _hoy())
+
+
+@router.get("/mi-avance")
+def metas_mi_avance(
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_user),
+):
+    # Modulo y empleado salen SIEMPRE del usuario autenticado, nunca de la
+    # peticion. Sin modulo o sin meta vigente hoy: 204, no es un error.
+    if current_user.modulo_id is None:
+        return Response(status_code=204)
+
+    hoy = _hoy()
+    params = {"fecha": hoy, "modulo_id": current_user.modulo_id}
+
+    modulo = db.execute(text("""
+        SELECT modulo, venta_dia, nivel, bolsa,
+               nivel_1, nivel_2, nivel_3, nivel_4,
+               bolsa_1, bolsa_2, bolsa_3, bolsa_4
+        FROM v_bolsa_diaria
+        WHERE fecha = :fecha
+          AND modulo_id = :modulo_id
+    """), params).mappings().first()
+
+    if modulo is None or modulo["nivel_1"] is None:
+        return Response(status_code=204)
+
+    escalera = [
+        {"nivel": n, "meta": modulo[f"nivel_{n}"], "bolsa": modulo[f"bolsa_{n}"]}
+        for n in range(1, 5)
+    ]
+    venta = modulo["venta_dia"] or 0
+    nivel = modulo["nivel"] or 0
+
+    siguiente = next(
+        (e for e in escalera if e["nivel"] > nivel and e["meta"] is not None), None
+    )
+    falta_siguiente = max(siguiente["meta"] - venta, 0) if siguiente else 0
+
+    # Una sola fila de agregados: el numero de participantes del modulo y la
+    # fila propia. Nombres y ventas de los companeros no salen de la BD.
+    mio = db.execute(text("""
+        SELECT COALESCE(MAX(n_participantes), 0) AS n_participantes,
+               MAX(venta_asesor) FILTER (WHERE empleado_id = :empleado_id) AS mi_venta,
+               MAX(participacion_pct) FILTER (WHERE empleado_id = :empleado_id) AS mi_participacion_pct,
+               MAX(le_toca) FILTER (WHERE empleado_id = :empleado_id) AS me_toca
+        FROM v_bolsa_asesor
+        WHERE fecha = :fecha
+          AND modulo_id = :modulo_id
+    """), {**params, "empleado_id": current_user.id}).mappings().one()
+
+    return {
+        "fecha": hoy.isoformat(),
+        "modulo": modulo["modulo"],
+        "venta_modulo": venta,
+        "nivel": nivel,
+        "bolsa": modulo["bolsa"] or 0,
+        "falta_siguiente": falta_siguiente,
+        "siguiente_nivel": siguiente["nivel"] if siguiente else None,
+        "escalera": escalera,
+        "mi_venta": mio["mi_venta"] or 0,
+        "mi_participacion_pct": mio["mi_participacion_pct"] or 0,
+        "n_participantes": mio["n_participantes"],
+        "me_toca": mio["me_toca"] or 0,
+    }
 
 
 @router.get("/asesores")
