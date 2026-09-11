@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.config import get_current_user
 from app.database import get_db
-from app.lector_capturas import leer_captura
+from app.lector_capturas import _a_24h, leer_captura
 
 router = APIRouter(prefix="/capturas-telcel", tags=["capturas-telcel"])
 
@@ -56,6 +56,53 @@ def _decodificar_foto(foto_base64: str) -> bytes:
     if len(img) < 3072:
         _err("FOTO_INVALIDA", "La imagen es demasiado pequeña. Vuelve a subirla.")
     return img
+
+
+def _candidatas_salida(datos):
+    """A partir de entrada_hora/salida_hora crudos de json_ia,
+    arma cada hora en su lectura original y en la lectura con el
+    meridiano contrario (+/- 12h). Devuelve lista de time sin
+    duplicados."""
+    formato = datos.get("formato_hora")
+    # En pantallas de 24h no hay meridiano que malinterpretar.
+    es_24h = (formato or "").strip().lower().replace(" ", "") in ("24h", "24")
+    contrario = {"am": "pm", "pm": "am"}
+
+    candidatas = []
+    for campo in ("entrada", "salida"):
+        hora = datos.get(f"{campo}_hora")
+        meridiano = datos.get(f"{campo}_meridiano")
+        lecturas = [meridiano]
+        if not es_24h and meridiano:
+            mer = str(meridiano).strip().lower().replace(".", "").replace(" ", "")
+            if mer in contrario:
+                lecturas.append(contrario[mer])
+        for mer in lecturas:
+            valor = _a_24h(hora, mer, formato)
+            if not valor:
+                continue
+            t = _time.fromisoformat(valor)
+            if t not in candidatas:
+                candidatas.append(t)
+    return candidatas
+
+
+def _reparar_salida_por_duracion(t_entrada, candidatas, dur_texto,
+                                 tolerancia=5):
+    """Devuelve la unica hora de salida cuya duracion contra
+    t_entrada cae dentro de +/- tolerancia minutos de dur_texto.
+    Devuelve None si hay cero coincidencias o mas de una."""
+    if t_entrada is None or dur_texto is None:
+        return None
+    min_entrada = t_entrada.hour * 60 + t_entrada.minute
+    coincidencias = []
+    for t in candidatas:
+        dur = (t.hour * 60 + t.minute) - min_entrada
+        if dur <= 0 or dur > TOPE_JORNADA_MIN:
+            continue
+        if abs(dur - dur_texto) <= tolerancia and t not in coincidencias:
+            coincidencias.append(t)
+    return coincidencias[0] if len(coincidencias) == 1 else None
 
 
 def _espejo_registros(db, username: str, fecha, tipo: str,
@@ -306,6 +353,34 @@ def subir_captura(
             )
 
         dur_texto = datos.get("duracion_texto_minutos")
+
+        # 3b. Antes de rechazar, intentar reparar un meridiano mal leido: con
+        #     la entrada ya fijada por la apertura, buscar la unica lectura de
+        #     salida (original o con meridiano contrario) que cuadre con
+        #     duracion_texto. Si no hay exactamente una, se rechaza abajo.
+        if (apertura.hora_entrada and dur_texto is not None
+                and dur_calc is not None and abs(dur_texto - dur_calc) > 5):
+            reparada = _reparar_salida_por_duracion(
+                t_entrada, _candidatas_salida(datos), dur_texto
+            )
+            if reparada is not None:
+                salida_original = t_salida
+                t_salida = reparada
+                dur_calc = (
+                    (t_salida.hour * 60 + t_salida.minute)
+                    - (t_entrada.hour * 60 + t_entrada.minute)
+                )
+                datos["_meridiano_corregido"] = True
+                datos["_salida_original"] = salida_original.strftime("%H:%M")
+                log.warning(
+                    "captura cierre con meridiano reparado por duracion_texto. "
+                    "usuario_id=%s username=%s fecha=%s clave=%s entrada=%s "
+                    "salida_original=%s salida_reparada=%s dur_texto=%s dur_calc=%s",
+                    destino.id, destino.username, fecha_captura.isoformat(),
+                    clave_leida, t_entrada.strftime("%H:%M"),
+                    datos["_salida_original"], t_salida.strftime("%H:%M"),
+                    dur_texto, dur_calc,
+                )
 
         # 4. duracion_texto es el testigo. Si existe y discrepa mas de 5 min
         #    del calculo, no confiamos en la lectura: rechazar.
