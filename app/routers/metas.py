@@ -15,11 +15,18 @@ router = APIRouter()
 ZONA = ZoneInfo("America/Mexico_City")
 ROLES_ADMIN = (models.RolEnum.admin, models.RolEnum.direccion)
 
+# Primer dia con metas vigentes. Los dias anteriores existen en el calendario
+# pero no cuentan: el frontend los pinta apagados.
+METAS_DESDE = date(2026, 9, 11)
+
+DIAS = ("Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom")
+
 # Solo lectura. Las vistas v_bolsa_* y metas_modulo viven en la BD; aqui no
 # se crean ni se modifican.
 #
 # Acceso: /hoy y /dia para cualquier usuario (venta y nivel del modulo).
 # /mi-avance para cualquier usuario con modulo: solo su modulo y su propia fila.
+# /mi-semana igual: los 7 dias de la semana en curso, solo sus propios bonos.
 # /asesores y /semana solo admin y direccion: exponen lo que cobra cada asesor.
 # /config solo admin.
 #
@@ -159,6 +166,55 @@ def metas_mi_avance(
         "mi_participacion_pct": mio["mi_participacion_pct"] or 0,
         "n_participantes": mio["n_participantes"],
         "me_toca": mio["me_toca"] or 0,
+    }
+
+
+@router.get("/mi-semana")
+def metas_mi_semana(
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_user),
+):
+    # Semana en curso (lunes a domingo) del modulo y el empleado del token.
+    # Sin parametros: nunca se consultan los bonos de otro asesor.
+    if current_user.modulo_id is None:
+        return Response(status_code=204)
+
+    lunes = _lunes_de(_hoy())
+    domingo = lunes + timedelta(days=6)
+
+    filas = db.execute(text("""
+        SELECT fecha, le_toca, nivel
+        FROM v_bolsa_asesor
+        WHERE fecha BETWEEN :lunes AND :domingo
+          AND modulo_id = :modulo_id
+          AND empleado_id = :empleado_id
+    """), {
+        "lunes": lunes,
+        "domingo": domingo,
+        "modulo_id": current_user.modulo_id,
+        "empleado_id": current_user.id,
+    }).mappings().all()
+
+    por_fecha = {f["fecha"]: f for f in filas}
+
+    # Los 7 dias salen siempre, tengan fila o no: el componente los pinta todos.
+    dias = []
+    for i in range(7):
+        fecha = lunes + timedelta(days=i)
+        fila = por_fecha.get(fecha)
+        dias.append({
+            "fecha": fecha.isoformat(),
+            "dia": DIAS[i],
+            "bono": (fila["le_toca"] if fila else 0) or 0,
+            "nivel": (fila["nivel"] if fila else 0) or 0,
+            "cuenta": fecha >= METAS_DESDE,
+        })
+
+    return {
+        "lunes": lunes.isoformat(),
+        "domingo": domingo.isoformat(),
+        "dias": dias,
+        "total": sum(d["bono"] for d in dias),
     }
 
 
