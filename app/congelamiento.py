@@ -28,12 +28,12 @@ from app import models
 logger = logging.getLogger(__name__)
 
 # La regla no es retroactiva. Ningun dia anterior a esta fecha se congela jamas.
-FECHA_INICIO_CONGELAMIENTO = date(2026, 8, 31)
+FECHA_INICIO_CONGELAMIENTO = date(2026, 9, 14)
 
 # True  = el dia congelado se MARCA pero se paga igual (modo aviso).
 # False = el dia congelado se descuenta de verdad.
 # Mientras esta en True ningun monto cambia: solo se agrega el flag al resultado.
-MODO_AVISO = True
+MODO_AVISO = False
 
 
 def aplicar_congelamiento(monto, esta_congelado: bool) -> tuple:
