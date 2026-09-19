@@ -1183,7 +1183,10 @@ def obtener_ventas_chips(
                 models.VentaChip.cancelada.isnot(True),
             )
         if solo_incubadora:
-            query = query.filter(models.VentaChip.es_incubadora == True)
+            query = query.filter(
+                models.VentaChip.es_incubadora == True,
+                models.VentaChip.validado.isnot(True),
+            )
         if fecha_inicio:
             query = query.filter(models.VentaChip.fecha >= fecha_inicio)
         if fecha_fin:
