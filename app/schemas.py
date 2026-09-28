@@ -1059,6 +1059,7 @@ class ModuloEstadItem(BaseModel):
     telefonos_contado: int
     telefonos_payjoy: int
     telefonos_paguitos: int
+    telefonos_plan: int = 0
     telefonos_total: int
     chips: int
     accesorios: int
@@ -1084,6 +1085,7 @@ class TelefonosStats(BaseModel):
     contado: CantidadMonto
     payjoy: CantidadMonto
     paguitos: CantidadMonto
+    plan: CantidadMonto
     sin_clasificar: CantidadMonto
 
 class AccesoriosStats(BaseModel):
@@ -1111,6 +1113,7 @@ class TelefonoModuloItem(BaseModel):
     contado: int
     payjoy: int
     paguitos: int
+    plan: int = 0
 
 class EstadisticasMesResponse(BaseModel):
     mes: str
@@ -1150,6 +1153,7 @@ class ModuloTiempoRealItem(BaseModel):
     telefonos_contado: int
     telefonos_payjoy: int
     telefonos_paguitos: int
+    telefonos_plan: int = 0
     telefonos_total: int
     chips: int
     accesorios: int

@@ -523,6 +523,7 @@ def estadisticas_mes(
         models.Venta.fecha >= fecha_inicio,
         models.Venta.fecha <= fecha_fin,
         models.Venta.cancelada.isnot(True),
+        func.coalesce(models.Venta.devuelta, False).is_(False),
         ~models.Modulo.nombre.in_(MODULOS_EXCLUIR_SQL),
     ]
     f_ventas_tel = f_ventas + [models.Venta.tipo_producto.ilike("telefono")]
@@ -551,6 +552,7 @@ def estadisticas_mes(
     contado: dict = {"cantidad": 0, "monto": 0.0}
     payjoy: dict = {"cantidad": 0, "monto": 0.0}
     paguitos: dict = {"cantidad": 0, "monto": 0.0}
+    plan: dict = {"cantidad": 0, "monto": 0.0}
     sin_clasificar: dict = {"cantidad": 0, "monto": 0.0}
 
     for row in tel_tipo_rows:
@@ -563,6 +565,10 @@ def estadisticas_mes(
         elif tv == "paguitos":
             paguitos["cantidad"] += cnt
             paguitos["monto"] += monto_t
+        elif tv == "plan":
+            # Pago inicial de un plan tarifario: es su propia categoria, no Contado.
+            plan["cantidad"] += cnt
+            plan["monto"] += monto_t
         elif not tv:
             sin_clasificar["cantidad"] += cnt
             sin_clasificar["monto"] += monto_t
@@ -571,8 +577,8 @@ def estadisticas_mes(
             contado["monto"] += monto_t
 
     total_telefonos = (
-        contado["cantidad"] + payjoy["cantidad"]
-        + paguitos["cantidad"] + sin_clasificar["cantidad"]
+        contado["cantidad"] + payjoy["cantidad"] + paguitos["cantidad"]
+        + plan["cantidad"] + sin_clasificar["cantidad"]
     )
 
     # ── Teléfonos por día ─────────────────────────────────────────────────────
@@ -814,6 +820,7 @@ def estadisticas_mes(
         "telefonos_contado": 0,
         "telefonos_payjoy": 0,
         "telefonos_paguitos": 0,
+        "telefonos_plan": 0,
         "telefonos_total": 0,
         "chips": 0,
         "accesorios": 0,
@@ -852,7 +859,7 @@ def estadisticas_mes(
     )
 
     tel_mod_map: dict = defaultdict(
-        lambda: {"total": 0, "monto": 0.0, "contado": 0, "payjoy": 0, "paguitos": 0}
+        lambda: {"total": 0, "monto": 0.0, "contado": 0, "payjoy": 0, "paguitos": 0, "plan": 0}
     )
     for row in tel_mod_desglose:
         tv = (row.tipo_venta or "").strip().lower()
@@ -868,6 +875,10 @@ def estadisticas_mes(
         elif tv == "paguitos":
             modulo_map[row.modulo]["telefonos_paguitos"] += cnt
             tel_mod_map[row.modulo]["paguitos"] += cnt
+        elif tv == "plan":
+            # Pago inicial de un plan tarifario: es su propia categoria, no Contado.
+            modulo_map[row.modulo]["telefonos_plan"] += cnt
+            tel_mod_map[row.modulo]["plan"] += cnt
         else:
             modulo_map[row.modulo]["telefonos_contado"] += cnt
             tel_mod_map[row.modulo]["contado"] += cnt
@@ -974,6 +985,7 @@ def estadisticas_mes(
                 telefonos_contado=vals["telefonos_contado"],
                 telefonos_payjoy=vals["telefonos_payjoy"],
                 telefonos_paguitos=vals["telefonos_paguitos"],
+                telefonos_plan=vals["telefonos_plan"],
                 telefonos_total=vals["telefonos_total"],
                 chips=vals["chips"],
                 accesorios=vals["accesorios"],
@@ -1017,6 +1029,7 @@ def estadisticas_mes(
                 contado=vals["contado"],
                 payjoy=vals["payjoy"],
                 paguitos=vals["paguitos"],
+                plan=vals["plan"],
             )
             for mod, vals in tel_mod_map.items()
             if vals["total"] > 0
@@ -1046,6 +1059,9 @@ def estadisticas_mes(
             ),
             paguitos=schemas.CantidadMonto(
                 cantidad=paguitos["cantidad"], monto=round(paguitos["monto"], 2)
+            ),
+            plan=schemas.CantidadMonto(
+                cantidad=plan["cantidad"], monto=round(plan["monto"], 2)
             ),
             sin_clasificar=schemas.CantidadMonto(
                 cantidad=sin_clasificar["cantidad"], monto=round(sin_clasificar["monto"], 2)
@@ -1134,6 +1150,7 @@ def tiempo_real(
     f_ventas_hoy = [
         models.Venta.fecha == hoy,
         models.Venta.cancelada.isnot(True),
+        func.coalesce(models.Venta.devuelta, False).is_(False),
         ~models.Modulo.nombre.in_(MODULOS_EXCLUIR_SQL),
     ]
     f_ventas_tel_hoy = f_ventas_hoy + [models.Venta.tipo_producto.ilike("telefono")]
@@ -1161,6 +1178,7 @@ def tiempo_real(
     contado: dict = {"cantidad": 0, "monto": 0.0}
     payjoy: dict = {"cantidad": 0, "monto": 0.0}
     paguitos: dict = {"cantidad": 0, "monto": 0.0}
+    plan: dict = {"cantidad": 0, "monto": 0.0}
     sin_clasificar: dict = {"cantidad": 0, "monto": 0.0}
 
     for row in tel_tipo_rows:
@@ -1173,6 +1191,10 @@ def tiempo_real(
         elif tv == "paguitos":
             paguitos["cantidad"] += cnt
             paguitos["monto"] += monto_t
+        elif tv == "plan":
+            # Pago inicial de un plan tarifario: es su propia categoria, no Contado.
+            plan["cantidad"] += cnt
+            plan["monto"] += monto_t
         elif not tv:
             sin_clasificar["cantidad"] += cnt
             sin_clasificar["monto"] += monto_t
@@ -1181,8 +1203,8 @@ def tiempo_real(
             contado["monto"] += monto_t
 
     total_telefonos = (
-        contado["cantidad"] + payjoy["cantidad"]
-        + paguitos["cantidad"] + sin_clasificar["cantidad"]
+        contado["cantidad"] + payjoy["cantidad"] + paguitos["cantidad"]
+        + plan["cantidad"] + sin_clasificar["cantidad"]
     )
 
     # ── Accesorios hoy ────────────────────────────────────────────────────────
@@ -1359,6 +1381,7 @@ def tiempo_real(
         "telefonos_contado": 0,
         "telefonos_payjoy": 0,
         "telefonos_paguitos": 0,
+        "telefonos_plan": 0,
         "telefonos_total": 0,
         "chips": 0,
         "accesorios": 0,
@@ -1401,6 +1424,9 @@ def tiempo_real(
             modulo_map_tr[row.modulo]["telefonos_payjoy"] += cnt
         elif tv == "paguitos":
             modulo_map_tr[row.modulo]["telefonos_paguitos"] += cnt
+        elif tv == "plan":
+            # Pago inicial de un plan tarifario: es su propia categoria, no Contado.
+            modulo_map_tr[row.modulo]["telefonos_plan"] += cnt
         else:
             modulo_map_tr[row.modulo]["telefonos_contado"] += cnt
 
@@ -1492,6 +1518,7 @@ def tiempo_real(
                 telefonos_contado=vals["telefonos_contado"],
                 telefonos_payjoy=vals["telefonos_payjoy"],
                 telefonos_paguitos=vals["telefonos_paguitos"],
+                telefonos_plan=vals["telefonos_plan"],
                 telefonos_total=vals["telefonos_total"],
                 chips=vals["chips"],
                 accesorios=vals["accesorios"],
@@ -1525,6 +1552,7 @@ def tiempo_real(
             contado=schemas.CantidadMonto(cantidad=contado["cantidad"], monto=round(contado["monto"], 2)),
             payjoy=schemas.CantidadMonto(cantidad=payjoy["cantidad"], monto=round(payjoy["monto"], 2)),
             paguitos=schemas.CantidadMonto(cantidad=paguitos["cantidad"], monto=round(paguitos["monto"], 2)),
+            plan=schemas.CantidadMonto(cantidad=plan["cantidad"], monto=round(plan["monto"], 2)),
             sin_clasificar=schemas.CantidadMonto(cantidad=sin_clasificar["cantidad"], monto=round(sin_clasificar["monto"], 2)),
         ),
         chips=schemas.ChipsStats(
