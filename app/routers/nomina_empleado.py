@@ -3,6 +3,7 @@ from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -164,22 +165,42 @@ def mi_recibo_pdf(
         ["Teléfonos:", fmt(fila.get("telefonos", 0))],
         ["Chips:", fmt(fila.get("chips", 0))],
         ["Incubadora:", fmt(fila.get("incubadora", 0))],
+    ]
+    # Líneas de incubadora pagadas, debajo de su renglón (solo cadena).
+    inc_ini = len(desglose_rows)
+    for ch in _incubadora_lineas(db, nomina, fila):
+        desglose_rows.append([
+            f"      {_fecha_dd_mes(ch['fecha'])}   {ch['numero_telefono']}",
+            fmt(ch["comision"]),
+        ])
+    inc_fin = len(desglose_rows) - 1
+    desglose_rows += [
         ["Planes tarifarios:", fmt(fila.get("planes", 0))],
         ["Com. pendientes:", fmt(fila.get("pendientes", 0))],
         ["Bonos:", fmt(fila.get("bonos", 0))],
         ["Subtotal:", fmt(fila.get("subtotal", 0))],
         ["Sanciones:", f"-{fmt(fila.get('sanciones', 0))}"],
     ]
-    d_table = Table(desglose_rows, colWidths=[200, 250])
-    d_table.setStyle(TableStyle([
+    i_sub = len(desglose_rows) - 2
+    i_san = len(desglose_rows) - 1
+    estilo = [
         ("FONTSIZE", (0, 0), (-1, -1), 10),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("FONTNAME", (0, 10), (-1, 11), "Helvetica-Bold"),
-        ("TEXTCOLOR", (1, 11), (1, 11), colors.HexColor("#dc2626")),
-        ("LINEABOVE", (0, 10), (-1, 10), 0.5, colors.HexColor("#e2e8f0")),
-    ]))
+        ("FONTNAME", (0, i_sub), (-1, i_san), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, i_san), (1, i_san), colors.HexColor("#dc2626")),
+        ("LINEABOVE", (0, i_sub), (-1, i_sub), 0.5, colors.HexColor("#e2e8f0")),
+    ]
+    if inc_fin >= inc_ini:
+        estilo += [
+            ("FONTSIZE", (0, inc_ini), (-1, inc_fin), 8.5),
+            ("TEXTCOLOR", (0, inc_ini), (-1, inc_fin), colors.HexColor("#475569")),
+            ("TOPPADDING", (0, inc_ini), (-1, inc_fin), 1),
+            ("BOTTOMPADDING", (0, inc_ini), (-1, inc_fin), 1),
+        ]
+    d_table = Table(desglose_rows, colWidths=[200, 250])
+    d_table.setStyle(TableStyle(estilo))
     elements.append(d_table)
 
     elements.append(Spacer(1, 6))
@@ -226,6 +247,87 @@ def _comision_unitaria(v) -> float:
     return base
 
 
+_MESES = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
+
+
+def _fecha_dd_mes(iso: str) -> str:
+    """'2026-09-16' -> '16-sep'."""
+    try:
+        _, m, d = iso.split("-")
+        return f"{d}-{_MESES[int(m) - 1]}"
+    except (ValueError, IndexError, AttributeError):
+        return str(iso)
+
+
+def _incubadora_lineas(db: Session, nomina, fila) -> list:
+    """Chips de incubadora que se pagaron en esta nómina, solo sección cadena.
+
+    Nóminas nuevas: los guarda crear/recalcular en fila["incubadora_chips"].
+    Nóminas viejas: se reconstruyen por fecha_validacion desde la nómina
+    anterior, primero hasta el creado_en de esta y, si no cuadra, hasta el de
+    la siguiente (una nómina recalculada paga chips validados después de
+    crearse). Si ninguna ventana suma exactamente fila["incubadora"] no se
+    mandan líneas (el recibo sigue mostrando solo el total)."""
+    if (fila.get("seccion") or "").strip() != "cadena":
+        return []
+
+    guardados = fila.get("incubadora_chips")
+    if guardados:
+        return guardados
+
+    total = round(float(fila.get("incubadora", 0) or 0), 2)
+    ids = fila.get("usuario_ids", [])
+    if total <= 0 or not ids or not nomina.creado_en:
+        return []
+
+    anterior = (
+        db.query(models.Nomina.creado_en)
+        .filter(models.Nomina.creado_en < nomina.creado_en)
+        .order_by(models.Nomina.creado_en.desc())
+        .first()
+    )
+    siguiente = (
+        db.query(models.Nomina.creado_en)
+        .filter(models.Nomina.creado_en > nomina.creado_en)
+        .order_by(models.Nomina.creado_en.asc())
+        .first()
+    )
+
+    def _chips_hasta(limite):
+        q = db.query(models.VentaChip).filter(
+            models.VentaChip.empleado_id.in_(ids),
+            models.VentaChip.es_incubadora == True,
+            models.VentaChip.validado == True,
+            models.VentaChip.comision_pagada == True,
+            models.VentaChip.cancelada == False,
+            models.VentaChip.fecha_validacion <= limite,
+        )
+        if anterior:
+            q = q.filter(models.VentaChip.fecha_validacion > anterior[0])
+        return q.all()
+
+    # total viene como float de JSON (ej. 88.78999999999999): comparar a centavos.
+    def _cuadra(chips):
+        return abs(sum(float(c.comision or 0) for c in chips) - total) < 0.005
+
+    chips = _chips_hasta(nomina.creado_en)
+    if not _cuadra(chips):
+        chips = _chips_hasta(siguiente[0] if siguiente else func.now())
+        if not _cuadra(chips):
+            return []
+
+    return [
+        {
+            "id": c.id,
+            "fecha": str(c.fecha),
+            "numero_telefono": c.numero_telefono,
+            "tipo_chip": c.tipo_chip,
+            "comision": round(float(c.comision or 0), 2),
+        }
+        for c in sorted(chips, key=lambda c: (c.fecha, c.numero_telefono or ""))
+    ]
+
+
 def _periodo_de_fila(nomina, fila):
     seccion = (fila.get("seccion") or "").strip()
     if seccion == "encargado":
@@ -256,6 +358,7 @@ def mi_recibo_detalle(
             "accesorios": [],
             "telefonos": [],
             "chips": [],
+            "incubadora": _incubadora_lineas(db, nomina, fila),
             "cuadre": None,
         }
 
@@ -400,6 +503,7 @@ def mi_recibo_detalle(
         "accesorios": lista_acc,
         "telefonos": lista_tel,
         "chips": lista_chip,
+        "incubadora": _incubadora_lineas(db, nomina, fila),
         "cuadre": {
             "cuadra": cuadra,
             "calculado": calc,

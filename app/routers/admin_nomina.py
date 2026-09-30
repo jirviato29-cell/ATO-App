@@ -332,6 +332,39 @@ def _safe_filename(text: str) -> str:
     return re.sub(r"[^\w\-]", "_", text)[:60]
 
 
+def _adjuntar_incubadora_chips(db: Session, datos: list, chip_ids: list) -> list:
+    """Copia de `datos` donde cada fila lleva en "incubadora_chips" los chips de
+    chip_ids que son de sus usuario_ids. Los que la fila ya traia se conservan
+    (recalcular agrega chips a una nomina guardada). Así el recibo sabe qué
+    chips se pagaron: venta_chips no guarda en qué nómina se pagó cada uno."""
+    chips = db.query(models.VentaChip).filter(models.VentaChip.id.in_(chip_ids)).all()
+    por_usuario: dict = defaultdict(list)
+    for c in chips:
+        por_usuario[c.empleado_id].append({
+            "id": c.id,
+            "fecha": str(c.fecha),
+            "numero_telefono": c.numero_telefono,
+            "tipo_chip": c.tipo_chip,
+            "comision": round(float(c.comision or 0), 2),
+        })
+
+    nuevos_datos = []
+    for fila in datos:
+        if not isinstance(fila, dict):
+            nuevos_datos.append(fila)
+            continue
+        nuevos = [ch for uid in fila.get("usuario_ids", []) for ch in por_usuario.get(uid, [])]
+        if not nuevos:
+            nuevos_datos.append(fila)
+            continue
+        previos = list(fila.get("incubadora_chips") or [])
+        ids_previos = {ch.get("id") for ch in previos}
+        lista = previos + [ch for ch in nuevos if ch["id"] not in ids_previos]
+        lista.sort(key=lambda ch: (ch["fecha"], ch["numero_telefono"] or ""))
+        nuevos_datos.append({**fila, "incubadora_chips": lista})
+    return nuevos_datos
+
+
 @router.post("/nominas", response_model=schemas.NominaResponse)
 def crear_nomina(
     data: schemas.NominaCreate,
@@ -380,6 +413,8 @@ def crear_nomina(
             if ya_pagados:
                 ids_str = ", ".join(str(r.id) for r in ya_pagados)
                 raise HTTPException(409, f"Los chips {ids_str} ya fueron pagados en una nómina anterior")
+
+            nomina.datos = _adjuntar_incubadora_chips(db, nomina.datos, data.chip_ids_incubadora)
 
             db.query(models.VentaChip).filter(
                 models.VentaChip.id.in_(data.chip_ids_incubadora),
@@ -529,6 +564,8 @@ def recalcular_nomina(
             if ya_pagados:
                 ids_str = ", ".join(str(r.id) for r in ya_pagados)
                 raise HTTPException(409, f"Los chips {ids_str} ya fueron pagados en una nómina anterior")
+
+            nomina.datos = _adjuntar_incubadora_chips(db, nomina.datos, data.chip_ids_incubadora)
 
             db.query(models.VentaChip).filter(
                 models.VentaChip.id.in_(data.chip_ids_incubadora),
