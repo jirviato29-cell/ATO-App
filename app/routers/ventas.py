@@ -2186,7 +2186,11 @@ def marcar_portabilidad(
 
     if data.realizada:
         chip.portabilidad_realizada = True
-        chip.fecha_portabilidad = datetime.now(ZoneInfo("America/Mexico_City")).replace(tzinfo=None)
+        # Solo el día, a las 00:00: VentaChipResponse lo expone como `date` y
+        # pydantic truena (500 en GET /venta_chips) si el datetime trae hora.
+        chip.fecha_portabilidad = datetime.now(ZoneInfo("America/Mexico_City")).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        )
     else:
         chip.portabilidad_realizada = False
         chip.fecha_portabilidad = None
