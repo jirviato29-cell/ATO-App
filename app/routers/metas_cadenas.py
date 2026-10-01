@@ -28,8 +28,10 @@ PARTICIPACION_SEMANAL_MIN = 30
 # activacion es usuarios.tienda_id del empleado. "subidas" = todas;
 # "validadas" = ademas validado = true. Las bolsas siempre usan validadas.
 #
-# Semana = lunes a domingo; pertenece al mes en que cae su domingo.
-# Mes = mes calendario.
+# Periodo = mes calendario; nada fuera del mes cuenta. Las semanas son
+# bloques fijos dentro del mes: 1 = dias 1-7, 2 = 8-14, 3 = 15-21,
+# 4 = 22-28. Del 29 en adelante no hay semana: esos dias solo cuentan para
+# la meta diaria y la mensual.
 #
 # Se aplica la fila de metas_tienda vigente hoy (mayor vigencia_inicio <= hoy)
 # a todos los dias y semanas del mes.
@@ -39,23 +41,26 @@ def _hoy() -> date:
     return datetime.now(ZONA).replace(tzinfo=None).date()
 
 
-def _lunes_de(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-
 def _fin_de_mes(d: date) -> date:
     siguiente = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
     return siguiente - timedelta(days=1)
 
 
-def _semanas_del_mes(inicio_mes: date, fin_mes: date) -> list:
-    # Una semana por cada domingo del mes: (lunes, domingo).
-    domingo = inicio_mes + timedelta(days=(6 - inicio_mes.weekday()))
-    semanas = []
-    while domingo <= fin_mes:
-        semanas.append((domingo - timedelta(days=6), domingo))
-        domingo += timedelta(days=7)
-    return semanas
+SEMANAS_POR_MES = 4
+DIAS_POR_SEMANA = 7
+
+
+def _semanas_del_mes(inicio_mes: date) -> list:
+    # Bloques fijos: (numero, primer dia, ultimo dia). Siempre caben en el mes
+    # porque el mes mas corto tiene 28 dias.
+    return [
+        (
+            n,
+            inicio_mes + timedelta(days=(n - 1) * DIAS_POR_SEMANA),
+            inicio_mes + timedelta(days=n * DIAS_POR_SEMANA - 1),
+        )
+        for n in range(1, SEMANAS_POR_MES + 1)
+    ]
 
 
 def _cumple(valor: int, meta) -> bool:
@@ -117,12 +122,9 @@ def mi_avance(
 
     inicio_mes = hoy.replace(day=1)
     fin_mes = _fin_de_mes(hoy)
-    inicio_semana = _lunes_de(hoy)
-    fin_semana = inicio_semana + timedelta(days=6)
-    semanas_mes = [s for s in _semanas_del_mes(inicio_mes, fin_mes) if s[0] <= hoy]
-
-    desde = min([inicio_mes, inicio_semana] + [s[0] for s in semanas_mes])
-    hasta = max(fin_mes, fin_semana)
+    semanas_mes = _semanas_del_mes(inicio_mes)
+    # Bloque en curso; None del dia 29 en adelante.
+    semana_actual = next((s for s in semanas_mes if s[1] <= hoy <= s[2]), None)
 
     filas = db.execute(text("""
         SELECT vc.empleado_id,
@@ -136,7 +138,7 @@ def mi_avance(
           AND COALESCE(vc.cancelada, false) = false
           AND vc.fecha BETWEEN :desde AND :hasta
         GROUP BY vc.empleado_id, vc.fecha
-    """), {"tienda_id": tienda_id, "desde": desde, "hasta": hasta}).mappings().all()
+    """), {"tienda_id": tienda_id, "desde": inicio_mes, "hasta": fin_mes}).mappings().all()
 
     conteos = {
         (f["empleado_id"], f["fecha"]): (int(f["subidas"]), int(f["validadas"]))
@@ -151,22 +153,39 @@ def mi_avance(
         ORDER BY nombre_completo
     """), {"tienda_id": tienda_id}).mappings().all()
 
-    # --- Tienda: dia, semana y mes ---
+    # --- Tienda: dia, semana (bloque en curso) y mes ---
     dia_sub, dia_val = _sumar(conteos, hoy, hoy)
-    sem_sub, sem_val = _sumar(conteos, inicio_semana, fin_semana)
     mes_sub, mes_val = _sumar(conteos, inicio_mes, fin_mes)
 
-    dias_semana = []
-    for i in range(7):
-        d = inicio_semana + timedelta(days=i)
-        s, v = _sumar(conteos, d, d)
-        dias_semana.append({
-            "fecha": d.isoformat(),
-            "dia": DIAS[i],
-            "subidas": s,
-            "validadas": v,
-            "cumplida": _cumple(v, meta["meta_diaria"]),
-        })
+    semana = None
+    if semana_actual is not None:
+        numero, inicio_semana, fin_semana = semana_actual
+        sem_sub, sem_val = _sumar(conteos, inicio_semana, fin_semana)
+        dias_semana = []
+        for i in range(DIAS_POR_SEMANA):
+            d = inicio_semana + timedelta(days=i)
+            s, v = _sumar(conteos, d, d)
+            dias_semana.append({
+                "fecha": d.isoformat(),
+                "dia": DIAS[d.weekday()],
+                "num_dia": d.day,
+                "subidas": s,
+                "validadas": v,
+                "cumplida": _cumple(v, meta["meta_diaria"]),
+            })
+        semana = {
+            "numero": numero,
+            "inicio": inicio_semana.isoformat(),
+            "fin": fin_semana.isoformat(),
+            "subidas": sem_sub,
+            "validadas": sem_val,
+            "meta": meta["meta_semanal"],
+            "cumplida": _cumple(sem_val, meta["meta_semanal"]),
+            "dias": dias_semana,
+        }
+        sem_val_tienda = sem_val
+    else:
+        sem_val_tienda = 0
 
     # --- Promotores ---
     promotores = []
@@ -175,7 +194,10 @@ def mi_avance(
             continue
         uid = u["id"]
         p_dia = _sumar(conteos, hoy, hoy, uid)
-        p_sem = _sumar(conteos, inicio_semana, fin_semana, uid)
+        p_sem = (
+            _sumar(conteos, semana_actual[1], semana_actual[2], uid)
+            if semana_actual is not None else (0, 0)
+        )
         p_mes = _sumar(conteos, inicio_mes, fin_mes, uid)
         promotores.append({
             "usuario_id": uid,
@@ -186,7 +208,7 @@ def mi_avance(
             "validadas_semana": p_sem[1],
             "subidas_mes": p_mes[0],
             "validadas_mes": p_mes[1],
-            "participacion_semana_pct": _pct(p_sem[1], sem_val),
+            "participacion_semana_pct": _pct(p_sem[1], sem_val_tienda),
             "participacion_mes_pct": _pct(p_mes[1], mes_val),
         })
     promotores.sort(key=lambda p: (-p["validadas_mes"], p["nombre"] or ""))
@@ -205,36 +227,39 @@ def mi_avance(
             dias_ganados += 1
         d += timedelta(days=1)
 
+    # Las 4 semanas siempre salen. Solo las cerradas suman: la en curso no
+    # cuenta hasta que termina su dia 7, y las pendientes aun no empiezan.
     semanas = []
     semanas_ganadas = 0
-    for lunes, domingo in semanas_mes:
-        _s, v_tienda = _sumar(conteos, lunes, domingo)
-        _s, v_mio = _sumar(conteos, lunes, domingo, yo)
+    semana_en_curso_califica = False
+    for numero, inicio_bloque, fin_bloque in semanas_mes:
+        if fin_bloque < hoy:
+            estado = "cerrada"
+        elif inicio_bloque <= hoy:
+            estado = "en_curso"
+        else:
+            estado = "pendiente"
+        _s, v_tienda = _sumar(conteos, inicio_bloque, fin_bloque)
+        _s, v_mio = _sumar(conteos, inicio_bloque, fin_bloque, yo)
         cumplida = _cumple(v_tienda, meta["meta_semanal"])
-        participacion = _pct(v_mio, v_tienda)
         califica = cumplida and v_tienda > 0 and v_mio * 100 >= PARTICIPACION_SEMANAL_MIN * v_tienda
-        en_curso = domingo >= hoy
-        if califica and not en_curso:
+        ganada = califica and estado == "cerrada"
+        if ganada:
             semanas_ganadas += 1
+        if estado == "en_curso":
+            semana_en_curso_califica = califica
         semanas.append({
-            "inicio": lunes.isoformat(),
-            "fin": domingo.isoformat(),
+            "numero": numero,
+            "inicio": inicio_bloque.isoformat(),
+            "fin": fin_bloque.isoformat(),
+            "estado": estado,
             "validadas_tienda": v_tienda,
             "mis_validadas": v_mio,
-            "participacion_pct": participacion,
+            "participacion_pct": _pct(v_mio, v_tienda),
             "cumplida": cumplida,
             "califica": califica,
-            "estado": "en_curso" if en_curso else "cerrada",
+            "ganada": ganada,
         })
-
-    # La semana en curso puede pertenecer al mes siguiente (su domingo cae
-    # en el otro mes); se evalua igual para el indicador.
-    _s, v_mio_sem = _sumar(conteos, inicio_semana, fin_semana, yo)
-    semana_en_curso_califica = (
-        _cumple(sem_val, meta["meta_semanal"])
-        and sem_val > 0
-        and v_mio_sem * 100 >= PARTICIPACION_SEMANAL_MIN * sem_val
-    )
 
     _s, v_mio_mes = _sumar(conteos, inicio_mes, fin_mes, yo)
     mensual_estimada = Decimal("0")
@@ -267,15 +292,8 @@ def mi_avance(
             "meta": meta["meta_diaria"],
             "cumplida": _cumple(dia_val, meta["meta_diaria"]),
         },
-        "semana": {
-            "inicio": inicio_semana.isoformat(),
-            "fin": fin_semana.isoformat(),
-            "subidas": sem_sub,
-            "validadas": sem_val,
-            "meta": meta["meta_semanal"],
-            "cumplida": _cumple(sem_val, meta["meta_semanal"]),
-            "dias": dias_semana,
-        },
+        "semana": semana,
+        "sin_semana": semana is None,
         "mes": {
             "inicio": inicio_mes.isoformat(),
             "fin": fin_mes.isoformat(),
