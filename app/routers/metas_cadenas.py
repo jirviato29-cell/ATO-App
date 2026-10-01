@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.config import get_current_user
 from app.database import get_db
+from app.utilidades import verificar_rol_requerido
 
 router = APIRouter()
 
@@ -313,4 +314,178 @@ def mi_avance(
             "total_acumulado": round(diaria_acumulada + semanal_acumulada + mensual_estimada, 2),
             "semanas": semanas,
         },
+    }
+
+
+# ── Resumen de todas las tiendas (admin y direccion) ────────────────────────
+# Mismas reglas que /mi-avance, calculadas para cada tienda con metas vigentes.
+# Solo lectura. La bolsa de la tienda es la suma de lo que lleva cada promotor.
+
+@router.get("/resumen")
+def resumen_tiendas(
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(
+        verificar_rol_requerido([models.RolEnum.admin, models.RolEnum.direccion])
+    ),
+):
+    hoy = _hoy()
+    inicio_mes = hoy.replace(day=1)
+    fin_mes = _fin_de_mes(hoy)
+    semanas_mes = _semanas_del_mes(inicio_mes)
+    semana_actual = next((s for s in semanas_mes if s[1] <= hoy <= s[2]), None)
+
+    tiendas = db.execute(text("""
+        SELECT DISTINCT ON (m.tienda_id)
+               t.id, t.nombre, COALESCE(c.nombre, 'Sin cadena') AS cadena,
+               m.meta_diaria, m.meta_semanal, m.meta_mensual,
+               m.bolsa_diaria, m.bolsa_semanal, m.bolsa_mensual
+        FROM metas_tienda m
+        JOIN tiendas t ON t.id = m.tienda_id
+        LEFT JOIN cadenas c ON c.id = t.cadena_id
+        WHERE m.vigencia_inicio <= :hoy
+        ORDER BY m.tienda_id, m.vigencia_inicio DESC, m.id DESC
+    """), {"hoy": hoy}).mappings().all()
+
+    if not tiendas:
+        return {"fecha": hoy.isoformat(), "semana": None, "tiendas": []}
+
+    ids = [t["id"] for t in tiendas]
+
+    filas = db.execute(text("""
+        SELECT u.tienda_id,
+               vc.empleado_id,
+               vc.fecha,
+               COUNT(*) AS subidas,
+               COUNT(*) FILTER (WHERE vc.validado IS TRUE) AS validadas
+        FROM venta_chips vc
+        JOIN usuarios u ON u.id = vc.empleado_id
+        WHERE u.tienda_id = ANY(:ids)
+          AND vc.tipo_chip = 'Activacion'
+          AND COALESCE(vc.cancelada, false) = false
+          AND vc.fecha BETWEEN :desde AND :hasta
+        GROUP BY u.tienda_id, vc.empleado_id, vc.fecha
+    """), {"ids": ids, "desde": inicio_mes, "hasta": fin_mes}).mappings().all()
+
+    usuarios = db.execute(text("""
+        SELECT id, nombre_completo, activo, tienda_id
+        FROM usuarios
+        WHERE tienda_id = ANY(:ids)
+        ORDER BY nombre_completo
+    """), {"ids": ids}).mappings().all()
+
+    conteos_por_tienda: dict = {}
+    for f in filas:
+        conteos_por_tienda.setdefault(f["tienda_id"], {})[(f["empleado_id"], f["fecha"])] = (
+            int(f["subidas"]), int(f["validadas"])
+        )
+    usuarios_por_tienda: dict = {}
+    for u in usuarios:
+        usuarios_por_tienda.setdefault(u["tienda_id"], []).append(u)
+
+    salida = []
+    for t in tiendas:
+        conteos = conteos_por_tienda.get(t["id"], {})
+        con_actividad = {emp for (emp, _f) in conteos}
+        meta_d, meta_s, meta_m = t["meta_diaria"], t["meta_semanal"], t["meta_mensual"]
+        bolsa_d = _num(t["bolsa_diaria"])
+        bolsa_s = _num(t["bolsa_semanal"])
+
+        dia_sub, dia_val = _sumar(conteos, hoy, hoy)
+        mes_sub, mes_val = _sumar(conteos, inicio_mes, fin_mes)
+
+        # Dias del mes (hasta hoy) en que la tienda cumplio su meta diaria.
+        dias_cumplidos = 0
+        d = inicio_mes
+        while d <= hoy:
+            if _cumple(_sumar(conteos, d, d)[1], meta_d):
+                dias_cumplidos += 1
+            d += timedelta(days=1)
+
+        semana = None
+        if semana_actual is not None:
+            numero, ini_s, fin_s = semana_actual
+            s_sub, s_val = _sumar(conteos, ini_s, fin_s)
+            semana = {
+                "numero": numero, "subidas": s_sub, "validadas": s_val,
+                "meta": meta_s, "cumplida": _cumple(s_val, meta_s),
+            }
+
+        semanas = []
+        for numero, ini_b, fin_b in semanas_mes:
+            estado = "cerrada" if fin_b < hoy else ("en_curso" if ini_b <= hoy else "pendiente")
+            v_b = _sumar(conteos, ini_b, fin_b)[1]
+            semanas.append({
+                "numero": numero, "estado": estado, "validadas": v_b,
+                "cumplida": _cumple(v_b, meta_s),
+            })
+
+        promotores = []
+        bolsa_tienda = 0.0
+        for u in usuarios_por_tienda.get(t["id"], []):
+            uid = u["id"]
+            if not u["activo"] and uid not in con_actividad:
+                continue
+            p_dia = _sumar(conteos, hoy, hoy, uid)
+            p_mes = _sumar(conteos, inicio_mes, fin_mes, uid)
+
+            # Bolsa del promotor con las mismas reglas que /mi-avance.
+            dias_ganados = 0
+            d = inicio_mes
+            while d <= hoy:
+                if _cumple(_sumar(conteos, d, d)[1], meta_d) and _sumar(conteos, d, d, uid)[1] >= 1:
+                    dias_ganados += 1
+                d += timedelta(days=1)
+            semanas_ganadas = 0
+            for numero, ini_b, fin_b in semanas_mes:
+                if fin_b >= hoy:
+                    continue
+                v_t = _sumar(conteos, ini_b, fin_b)[1]
+                v_m = _sumar(conteos, ini_b, fin_b, uid)[1]
+                if _cumple(v_t, meta_s) and v_t > 0 and v_m * 100 >= PARTICIPACION_SEMANAL_MIN * v_t:
+                    semanas_ganadas += 1
+            mensual = Decimal("0")
+            if _cumple(mes_val, meta_m) and p_mes[1] > 0 and t["bolsa_mensual"] is not None:
+                mensual = (Decimal(str(t["bolsa_mensual"])) * p_mes[1] / mes_val).quantize(
+                    Decimal("0.01"), rounding=ROUND_FLOOR
+                )
+            bolsa_p = round(bolsa_d * dias_ganados + bolsa_s * semanas_ganadas + float(mensual), 2)
+            bolsa_tienda += bolsa_p
+
+            promotores.append({
+                "usuario_id": uid,
+                "nombre": u["nombre_completo"],
+                "subidas_dia": p_dia[0],
+                "validadas_dia": p_dia[1],
+                "subidas_mes": p_mes[0],
+                "validadas_mes": p_mes[1],
+                "participacion_mes_pct": _pct(p_mes[1], mes_val),
+                "bolsa": bolsa_p,
+            })
+        promotores.sort(key=lambda p: (-p["validadas_mes"], p["nombre"] or ""))
+
+        salida.append({
+            "tienda_id": t["id"],
+            "tienda": t["nombre"],
+            "cadena": t["cadena"],
+            "dia": {"subidas": dia_sub, "validadas": dia_val, "meta": meta_d,
+                    "cumplida": _cumple(dia_val, meta_d)},
+            "semana": semana,
+            "mes": {"subidas": mes_sub, "validadas": mes_val, "meta": meta_m,
+                    "cumplida": _cumple(mes_val, meta_m)},
+            "dias_cumplidos": dias_cumplidos,
+            "semanas": semanas,
+            "bolsa_acumulada": round(bolsa_tienda, 2),
+            "promotores": promotores,
+        })
+
+    salida.sort(key=lambda x: (x["cadena"], x["tienda"]))
+
+    return {
+        "fecha": hoy.isoformat(),
+        "semana": (
+            {"numero": semana_actual[0], "inicio": semana_actual[1].isoformat(),
+             "fin": semana_actual[2].isoformat()}
+            if semana_actual is not None else None
+        ),
+        "tiendas": salida,
     }
