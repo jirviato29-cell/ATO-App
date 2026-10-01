@@ -13,6 +13,7 @@ from app.routers import equipos_telcel
 from app.routers import capturas_telcel
 from app.routers import cadenas_ventas
 from app.routers import metas
+from app.routers import metas_cadenas
 from fastapi.middleware.cors import CORSMiddleware
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
@@ -70,3 +71,4 @@ app.include_router(equipos_telcel.router, prefix="/equipos_telcel", tags=["Equip
 app.include_router(capturas_telcel.router)
 app.include_router(cadenas_ventas.router, prefix="/ventas-cadenas", tags=["Ventas Cadenas"])
 app.include_router(metas.router, prefix="/api/metas", tags=["Metas"])
+app.include_router(metas_cadenas.router, prefix="/metas-cadenas", tags=["Metas Cadenas"])
