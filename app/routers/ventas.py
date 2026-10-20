@@ -1256,6 +1256,14 @@ def validar_chip(
     tipo = chip.tipo_chip
     monto = int(chip.monto_recarga or 0)
 
+    # Boletín 63 de Cadenas Comerciales (módulo 7) solo se valida en C Líneas,
+    # con la comisión que trae el archivo de Telcel. Los de módulos ATO siguen manual.
+    if tipo in ("Boletin 63", "B63") and chip.empleado and chip.empleado.modulo_id == 7:
+        raise HTTPException(
+            status_code=400,
+            detail="El Boletín 63 de Cadenas se valida en C Líneas al subir el archivo de Telcel, con la comisión que trae Telcel",
+        )
+
     if tipo == "Activacion":
         if data.comision_manual is None:
             raise HTTPException(status_code=400, detail="Debe proporcionar una comisión para chip Activacion")
