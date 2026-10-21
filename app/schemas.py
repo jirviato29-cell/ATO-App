@@ -839,7 +839,8 @@ class EntradaItem(BaseModel):
 
 class EntradaMercanciaRequest(BaseModel):
     modulo_id: int
-    productos: list[EntradaItem]
+    productos: list[EntradaItem] = []
+    paquetes_chips: list[str] = []
 
 
 class EditarEntradaRequest(BaseModel):

@@ -6,7 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, Form
 from fastapi.params import File
 from zoneinfo import ZoneInfo
-from sqlalchemy import func, text, or_
+from sqlalchemy import func, text, or_, bindparam
 from app import models, schemas
 from app.config import get_current_user
 from app.database import get_db
@@ -364,6 +364,76 @@ def catalogo_productos(
 
 
 
+def _chips_de_paquetes(db: Session, paquetes: list[str], bloquear: bool = False):
+    """Chips de los paquetes pedidos, validando que existan y sigan en bodega.
+
+    Con bloquear=True toma FOR UPDATE de las filas para que nadie más las
+    surta o venda antes del commit de la entrada.
+    """
+    sql = """
+        SELECT c.id, c.clave, c.numero, c.iccid, c.estatus, c.posicion,
+               UPPER(TRIM(c.paquete)) AS paquete, c.modulo_id, m.nombre AS modulo_nombre
+        FROM inventario_chips c
+        LEFT JOIN modulos m ON m.id = c.modulo_id
+        WHERE UPPER(TRIM(c.paquete)) IN :paquetes
+        ORDER BY UPPER(TRIM(c.paquete)), c.posicion
+    """
+    if bloquear:
+        sql += " FOR UPDATE OF c"
+    rows = db.execute(
+        text(sql).bindparams(bindparam("paquetes", expanding=True)),
+        {"paquetes": paquetes},
+    ).mappings().all()
+
+    encontrados = {r["paquete"] for r in rows}
+    faltantes = [p for p in paquetes if p not in encontrados]
+    if faltantes:
+        raise HTTPException(
+            status_code=404,
+            detail=f"El paquete {', '.join(faltantes)} no existe",
+        )
+
+    no_disponibles = [r for r in rows if r["estatus"] != "en_bodega"]
+    if no_disponibles:
+        lista = ", ".join(
+            f"{r['clave']} ({r['estatus']}, módulo {r['modulo_nombre'] or 'sin módulo'})"
+            for r in no_disponibles
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Hay chips que ya no están en bodega: {lista}",
+        )
+    return rows
+
+
+@router.get("/inventario/chips/paquete/{paquete}")
+def buscar_paquete_chips(
+    paquete: str,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(
+        verificar_rol_requerido([models.RolEnum.admin])
+    ),
+):
+    paquete = paquete.strip().upper()
+    if not paquete:
+        raise HTTPException(status_code=400, detail="Escribe el paquete de chips")
+    rows = _chips_de_paquetes(db, [paquete])
+    return {
+        "paquete": paquete,
+        "chips": [
+            {
+                "clave": r["clave"],
+                "numero": r["numero"],
+                "iccid": r["iccid"],
+                "estatus": r["estatus"],
+                "modulo_id": r["modulo_id"],
+                "modulo_nombre": r["modulo_nombre"],
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.post("/inventario/entrada_mercancia")
 def entrada_mercancia(
     data: schemas.EntradaMercanciaRequest,
@@ -373,12 +443,20 @@ def entrada_mercancia(
     )
 ):
 
-    if not data.productos:
-        raise HTTPException(status_code=400, detail="La entrada debe tener al menos un producto")
+    paquetes = list(dict.fromkeys(
+        p.strip().upper() for p in data.paquetes_chips if p and p.strip()
+    ))
+
+    if not data.productos and not paquetes:
+        raise HTTPException(status_code=400, detail="La entrada debe tener al menos un producto o paquete de chips")
 
     modulo = db.query(models.Modulo).filter(models.Modulo.id == data.modulo_id).first()
     if not modulo:
         raise HTTPException(status_code=400, detail=f"Módulo ID {data.modulo_id} no existe")
+
+    # Se revalida con las filas bloqueadas: entre la búsqueda del paquete en
+    # pantalla y el guardado alguien pudo surtirlo o venderlo.
+    chips = _chips_de_paquetes(db, paquetes, bloquear=True) if paquetes else []
 
     # Deduplicar: si el mismo producto_id aparece más de una vez, sumar cantidades
     dedup: dict[int, int] = {}
@@ -450,6 +528,22 @@ def entrada_mercancia(
             referencia_id=entrada.id,
         )
 
+    if chips:
+        db.execute(
+            text("""
+                UPDATE inventario_chips
+                SET estatus = 'surtido', modulo_id = :modulo_id,
+                    entrada_id = :entrada_id, fecha_surtido = :fecha
+                WHERE id IN :ids
+            """).bindparams(bindparam("ids", expanding=True)),
+            {
+                "modulo_id": data.modulo_id,
+                "entrada_id": entrada.id,
+                "fecha": datetime.now(ZoneInfo("America/Mexico_City")).replace(tzinfo=None),
+                "ids": [c["id"] for c in chips],
+            },
+        )
+
     db.commit()
     return {"ok": True, "folio": folio, "message": "Entrada registrada correctamente"}
 
@@ -500,6 +594,17 @@ def listar_entradas_mercancia(
         .all()
     )
 
+    chips_por_entrada = {}
+    if rows:
+        chips_por_entrada = dict(db.execute(
+            text("""
+                SELECT entrada_id, COUNT(*) FROM inventario_chips
+                WHERE entrada_id IN :ids
+                GROUP BY entrada_id
+            """).bindparams(bindparam("ids", expanding=True)),
+            {"ids": [entrada.id for entrada, _, _ in rows]},
+        ).all())
+
     resultado = []
     for entrada, modulo, usuario in rows:
         kardex_items = (
@@ -536,6 +641,7 @@ def listar_entradas_mercancia(
                 }
                 for krow in kardex_items
             ],
+            "total_chips": chips_por_entrada.get(entrada.id, 0),
         })
 
     return resultado
@@ -584,6 +690,16 @@ def obtener_detalle_entrada(
         for e in equipos
     ]
 
+    chips = db.execute(
+        text("""
+            SELECT clave, numero, iccid, estatus, UPPER(TRIM(paquete)) AS paquete
+            FROM inventario_chips
+            WHERE entrada_id = :entrada_id
+            ORDER BY UPPER(TRIM(paquete)), posicion
+        """),
+        {"entrada_id": entrada_id},
+    ).mappings().all()
+
     return {
         "id": entrada.id,
         "folio": entrada.folio,
@@ -597,6 +713,7 @@ def obtener_detalle_entrada(
             for r in rows
         ],
         "equipos": equipos_out,
+        "chips": [dict(c) for c in chips],
     }
 
 
@@ -702,6 +819,26 @@ def eliminar_entrada_mercancia(
     if not entrada:
         raise HTTPException(status_code=404, detail="La entrada ya fue eliminada por otro proceso")
 
+    # Chips surtidos por esta entrada. Se bloquean para que una venta
+    # concurrente no se cuele entre este chequeo y el commit.
+    chips_entrada = db.execute(
+        text("""
+            SELECT id, clave, estatus FROM inventario_chips
+            WHERE entrada_id = :entrada_id
+            FOR UPDATE
+        """),
+        {"entrada_id": entrada_id},
+    ).mappings().all()
+    chips_vendidos = [c["clave"] for c in chips_entrada if c["estatus"] == "vendido"]
+    if chips_vendidos:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No se puede eliminar la entrada: {len(chips_vendidos)} chip(s) "
+                f"ya están vendidos: {', '.join(sorted(chips_vendidos))}"
+            ),
+        )
+
     # Limpiar todos los kardex de esta entrada (ENTRADA originales + AJUSTEs de ediciones)
     # antes de registrar el AJUSTE_NEGATIVO de auditoría de esta eliminación
     db.query(models.KardexMovimiento).filter(
@@ -739,12 +876,25 @@ def eliminar_entrada_mercancia(
             equipos_revertidos += 1
         e.folio = None
 
+    # Devolver a bodega los chips de esta entrada, en la misma transacción.
+    if chips_entrada:
+        db.execute(
+            text("""
+                UPDATE inventario_chips
+                SET estatus = 'en_bodega', modulo_id = NULL,
+                    entrada_id = NULL, fecha_surtido = NULL
+                WHERE entrada_id = :entrada_id
+            """),
+            {"entrada_id": entrada_id},
+        )
+
     db.delete(entrada)
     db.commit()
     return {
         "ok": True,
         "message": f"Entrada {folio_entrada} eliminada correctamente",
         "equipos_revertidos": equipos_revertidos,
+        "chips_revertidos": len(chips_entrada),
     }
 
 
