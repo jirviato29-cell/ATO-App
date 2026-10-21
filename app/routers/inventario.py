@@ -434,6 +434,115 @@ def buscar_paquete_chips(
     }
 
 
+# Cruce de solo lectura con venta_chips: si el número tiene una venta no
+# cancelada, el chip cuenta como vendido aunque la tabla diga otra cosa.
+# Con varias ventas del mismo número se toma la más reciente.
+SQL_CONTROL_CHIPS = """
+    WITH ventas AS (
+        SELECT DISTINCT ON (v.num)
+               v.num, v.fecha, v.tipo_chip, u.nombre_englobado AS asesor
+        FROM (
+            SELECT vc.*,
+                   regexp_replace(coalesce(vc.numero_telefono, ''), '[^0-9]', '', 'g') AS num
+            FROM venta_chips vc
+            WHERE coalesce(vc.cancelada, false) = false
+        ) v
+        LEFT JOIN usuarios u ON u.id = v.empleado_id
+        WHERE v.num <> ''
+        ORDER BY v.num, v.fecha DESC, v.hora DESC, v.id DESC
+    )
+    SELECT c.clave, UPPER(TRIM(c.paquete)) AS paquete, c.posicion,
+           c.numero, c.iccid, c.estatus::text AS estatus,
+           c.modulo_id, m.nombre AS modulo, e.folio, c.fecha_surtido,
+           vt.fecha AS fecha_venta, vt.asesor, vt.tipo_chip,
+           CASE WHEN vt.num IS NOT NULL THEN 'vendido' ELSE c.estatus::text END AS estatus_real
+    FROM inventario_chips c
+    LEFT JOIN modulos m ON m.id = c.modulo_id
+    LEFT JOIN entradas_mercancia e ON e.id = c.entrada_id
+    LEFT JOIN ventas vt
+           ON vt.num = regexp_replace(coalesce(c.numero, ''), '[^0-9]', '', 'g')
+    ORDER BY UPPER(TRIM(c.paquete)), c.posicion
+"""
+
+
+@router.get("/inventario/chips/control")
+def control_chips(
+    modulo_id: Optional[int] = Query(None),
+    estatus: Optional[str] = Query(None),
+    paquete: Optional[str] = Query(None),
+    numero: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(
+        verificar_rol_requerido([models.RolEnum.admin])
+    ),
+):
+    rows = db.execute(text(SQL_CONTROL_CHIPS)).mappings().all()
+
+    # Resumen global: no depende de los filtros de la tabla de detalle
+    totales = {"en_bodega": 0, "surtidos": 0, "vendidos": 0, "pendientes": 0}
+    por_modulo: dict = {}
+    for r in rows:
+        vendido = r["estatus_real"] == "vendido"
+        if r["estatus_real"] == "en_bodega":
+            totales["en_bodega"] += 1
+        if vendido:
+            totales["vendidos"] += 1
+        if r["modulo_id"] is None and not vendido:
+            continue
+        fila = por_modulo.setdefault(r["modulo_id"], {
+            "modulo_id": r["modulo_id"],
+            "modulo": r["modulo"] or "Sin módulo",
+            "surtidos": 0, "vendidos": 0, "pendientes": 0,
+        })
+        if vendido:
+            fila["vendidos"] += 1
+        if r["modulo_id"] is not None:
+            fila["surtidos"] += 1
+            totales["surtidos"] += 1
+            if not vendido:
+                fila["pendientes"] += 1
+                totales["pendientes"] += 1
+
+    paquete_f = paquete.strip().upper() if paquete and paquete.strip() else None
+    numero_f = "".join(ch for ch in numero if ch.isdigit()) if numero else ""
+    estatus_f = estatus.strip().lower() if estatus and estatus.strip() else None
+
+    chips = []
+    for r in rows:
+        if modulo_id is not None and r["modulo_id"] != modulo_id:
+            continue
+        if estatus_f and r["estatus_real"] != estatus_f:
+            continue
+        if paquete_f and r["paquete"] != paquete_f:
+            continue
+        if numero_f and numero_f not in "".join(ch for ch in (r["numero"] or "") if ch.isdigit()):
+            continue
+        chips.append({
+            "clave": r["clave"],
+            "paquete": r["paquete"],
+            "numero": r["numero"],
+            "iccid": r["iccid"],
+            "estatus": r["estatus"],
+            "estatus_real": r["estatus_real"],
+            "modulo_id": r["modulo_id"],
+            "modulo": r["modulo"],
+            "folio": r["folio"],
+            "fecha_surtido": r["fecha_surtido"],
+            "fecha_venta": r["fecha_venta"],
+            "asesor": r["asesor"],
+            "tipo_chip": r["tipo_chip"],
+        })
+
+    return {
+        "totales": totales,
+        "por_modulo": sorted(
+            por_modulo.values(),
+            key=lambda f: (f["modulo_id"] is None, f["modulo"]),
+        ),
+        "chips": chips,
+    }
+
+
 @router.post("/inventario/entrada_mercancia")
 def entrada_mercancia(
     data: schemas.EntradaMercanciaRequest,
