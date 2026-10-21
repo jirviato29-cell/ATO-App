@@ -10,7 +10,7 @@ from sqlalchemy import func, text, or_, bindparam
 from app import models, schemas
 from app.config import get_current_user
 from app.database import get_db
-from app.utilidades import verificar_rol_requerido
+from app.utilidades import verificar_rol_requerido, verificar_modulo_no_congelado
 from sqlalchemy.orm import Session
 from app.models import InventarioGeneral, InventarioModulo, EntradaMercancia
 from datetime import datetime, date
@@ -453,6 +453,7 @@ def entrada_mercancia(
     modulo = db.query(models.Modulo).filter(models.Modulo.id == data.modulo_id).first()
     if not modulo:
         raise HTTPException(status_code=400, detail=f"Módulo ID {data.modulo_id} no existe")
+    verificar_modulo_no_congelado(db, data.modulo_id)
 
     # Se revalida con las filas bloqueadas: entre la búsqueda del paquete en
     # pantalla y el guardado alguien pudo surtirlo o venderlo.
