@@ -1,8 +1,10 @@
 
+import os
 import sys
 import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func
 from fastapi import APIRouter, Depends, HTTPException, status
 from psycopg2 import IntegrityError
@@ -18,6 +20,25 @@ from app.utilidades import verificar_rol_requerido
 
 
 router = APIRouter()
+
+
+# Copia reversible de la contraseña (además del bcrypt) para que el admin la
+# pueda ver. Sin PASSWORD_ENC_KEY (o con una llave inválida) no se guarda copia
+# y el arranque no se ve afectado.
+def _fernet():
+    llave = os.getenv("PASSWORD_ENC_KEY")
+    if not llave:
+        return None
+    try:
+        return Fernet(llave.strip().encode())
+    except (ValueError, TypeError):
+        print("PASSWORD_ENC_KEY no es una llave Fernet válida", file=sys.stderr, flush=True)
+        return None
+
+
+def cifrar_contraseña(password: str):
+    f = _fernet()
+    return f.encrypt(password.encode()).decode() if f else None
 
 
 # ------------------- REGISTRO -------------------
@@ -57,6 +78,7 @@ def registrar_usuario(
             username=usuario.username,
             rol=usuario.rol,
             password=hashear_contraseña(usuario.password),
+            password_cifrada=cifrar_contraseña(usuario.password),
             modulo=modulo_obj,
             is_admin=usuario.is_admin or False,
             forma_pago=usuario.forma_pago or None,
@@ -475,6 +497,7 @@ def editar_usuario(
             if len(datos.password) < 8 or not any(c.isdigit() for c in datos.password) or not any(c.isalpha() for c in datos.password):
                 raise HTTPException(status_code=400, detail="La contraseña no cumple con los requisitos")
             usuario_db.password = hashear_contraseña(datos.password)
+            usuario_db.password_cifrada = cifrar_contraseña(datos.password)
         if datos.sueldo_base is not None:
             usuario_db.sueldo_base = datos.sueldo_base
         if "forma_pago" in datos.model_fields_set:
@@ -506,6 +529,28 @@ def editar_usuario(
         print("================================", file=sys.stderr, flush=True)
         raise HTTPException(status_code=500, detail=f"Error interno: {type(e).__name__}: {str(e)}")
 
+
+
+@router.get("/usuarios/{usuario_id}/password")
+def ver_contraseña_usuario(
+    usuario_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(verificar_rol_requerido(models.RolEnum.admin))
+):
+    f = _fernet()
+    if f is None:
+        raise HTTPException(status_code=503, detail="Llave no configurada")
+
+    usuario_db = db.query(models.Usuario).filter_by(id=usuario_id).first()
+    if not usuario_db:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if not usuario_db.password_cifrada:
+        return {"password": None}
+    try:
+        return {"password": f.decrypt(usuario_db.password_cifrada.encode()).decode()}
+    except InvalidToken:
+        # Cifrada con otra llave: se trata como si no hubiera copia
+        return {"password": None}
 
 
 @router.delete("/usuarios/{usuario_id}")

@@ -25,6 +25,9 @@ class Usuario(Base):
     username = Column(String, unique=True, nullable=False)
     rol = Column(Enum(RolEnum), nullable=False, default=RolEnum.asesor)
     password = Column(String, nullable=False)
+    # Copia cifrada con Fernet (PASSWORD_ENC_KEY) para que el admin pueda verla.
+    # Nunca va en un schema de respuesta salvo GET /usuarios/{id}/password.
+    password_cifrada = Column(Text, nullable=True)
     modulo_id = Column(Integer, ForeignKey("modulos.id"), nullable=True)
     is_admin = Column(Boolean, default=False)
     activo = Column(Boolean, default=True)

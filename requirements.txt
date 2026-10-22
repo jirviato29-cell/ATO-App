@@ -61,3 +61,4 @@ supafunc==0.6.2
 twilio
 anthropic==0.95.0
 Pillow==12.1.1
+cryptography==50.0.2
