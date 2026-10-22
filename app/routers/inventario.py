@@ -434,6 +434,53 @@ def buscar_paquete_chips(
     }
 
 
+# Lo usa el asesor al vender un chip: valida la clave impresa (ej. A16-3) y
+# regresa número e ICCID. Solo lectura; la venta se guarda en /venta_chips.
+@router.get("/inventario/chips/clave/{clave}")
+def buscar_chip_por_clave(
+    clave: str,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_user),
+):
+    clave = clave.strip().upper()
+    if not clave:
+        raise HTTPException(status_code=400, detail="Escribe la clave del chip")
+
+    chip = db.execute(text("""
+        SELECT c.clave, c.numero, c.iccid, c.modulo_id, m.nombre AS modulo_nombre
+        FROM inventario_chips c
+        LEFT JOIN modulos m ON m.id = c.modulo_id
+        WHERE UPPER(TRIM(c.clave)) = :clave
+        LIMIT 1
+    """), {"clave": clave}).mappings().first()
+    if not chip:
+        raise HTTPException(status_code=404, detail=f"La clave {clave} no existe")
+
+    # Se revisa antes que el módulo: si ya se vendió, ese es el dato útil
+    num = "".join(ch for ch in (chip["numero"] or "") if ch.isdigit())
+    if num:
+        venta = db.execute(text("""
+            SELECT vc.fecha
+            FROM venta_chips vc
+            WHERE coalesce(vc.cancelada, false) = false
+              AND regexp_replace(coalesce(vc.numero_telefono, ''), '[^0-9]', '', 'g') = :num
+            ORDER BY vc.fecha DESC, vc.hora DESC, vc.id DESC
+            LIMIT 1
+        """), {"num": num}).mappings().first()
+        if venta:
+            fecha = venta["fecha"].strftime("%d/%m/%Y") if venta["fecha"] else "una fecha sin registrar"
+            raise HTTPException(status_code=409, detail=f"Este chip ya se vendió el {fecha}")
+
+    if chip["modulo_id"] is None or chip["modulo_id"] != current_user.modulo_id:
+        donde = f"en el módulo {chip['modulo_nombre']}" if chip["modulo_id"] is not None else "en bodega"
+        raise HTTPException(
+            status_code=409,
+            detail=f"El chip {chip['clave']} no está surtido a tu módulo: está {donde}",
+        )
+
+    return {"clave": chip["clave"], "numero": chip["numero"], "iccid": chip["iccid"]}
+
+
 # Cruce de solo lectura con venta_chips: si el número tiene una venta no
 # cancelada, el chip cuenta como vendido aunque la tabla diga otra cosa.
 # Con varias ventas del mismo número se toma la más reciente.
