@@ -224,6 +224,9 @@ class VentaChip(Base):
     portabilidad_realizada = Column(Boolean, default=False, nullable=False)
     fecha_portabilidad = Column(DateTime, nullable=True)
     cambio_chip = Column(Boolean, default=False, nullable=False)
+    marca = Column(String(60), nullable=True)
+    modelo = Column(String(100), nullable=True)
+    precio = Column(Numeric(10, 2), nullable=True)
 
     empleado = relationship("Usuario", foreign_keys=[empleado_id])
 

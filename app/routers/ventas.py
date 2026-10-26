@@ -1053,6 +1053,9 @@ def crear_venta_chip(
         fecha_portabilidad=fecha_porta,
         portabilidad_realizada=realizada,
         cambio_chip=venta.cambio_chip,
+        marca=(venta.marca or "").strip() or None,
+        modelo=(venta.modelo or "").strip() or None,
+        precio=venta.precio,
     )
 
     # ── Auto-validar Tarjetas PayJoy (comisión fija, sin necesidad de validación admin)

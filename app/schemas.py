@@ -316,6 +316,9 @@ class VentaChipCreate(BaseModel):
     nip: Optional[str] = None
     fecha_portabilidad: Optional[date] = None
     cambio_chip: bool = False
+    marca: Optional[str] = None
+    modelo: Optional[str] = None
+    precio: Optional[float] = None
   
 
 class VentaChipResponse(VentaChipCreate):
