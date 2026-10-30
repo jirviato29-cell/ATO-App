@@ -22,10 +22,14 @@ DIAS = ("Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom")
 # la bolsa semanal.
 PARTICIPACION_SEMANAL_MIN = 30
 
+# Tipos de chip que cuentan como activacion para las metas de cadenas. Se
+# comparan contra UPPER(TRIM(tipo_chip)), por eso van en mayusculas.
+TIPOS_ACTIVACION_CADENAS = ["ACTIVACION", "BOLETIN 63", "B63"]
+
 # Solo lectura. metas_tienda, usuarios, venta_chips y tiendas viven en la BD;
 # aqui no se crean ni se modifican.
 #
-# Conteo: solo tipo_chip = 'Activacion' y no canceladas. La tienda de cada
+# Conteo: solo tipos de TIPOS_ACTIVACION_CADENAS y no canceladas. La tienda de cada
 # activacion es usuarios.tienda_id del empleado. "subidas" = todas;
 # "validadas" = ademas validado = true. Las bolsas siempre usan validadas.
 #
@@ -135,11 +139,12 @@ def mi_avance(
         FROM venta_chips vc
         JOIN usuarios u ON u.id = vc.empleado_id
         WHERE u.tienda_id = :tienda_id
-          AND vc.tipo_chip = 'Activacion'
+          AND UPPER(TRIM(vc.tipo_chip)) = ANY(:tipos_activacion)
           AND COALESCE(vc.cancelada, false) = false
           AND vc.fecha BETWEEN :desde AND :hasta
         GROUP BY vc.empleado_id, vc.fecha
-    """), {"tienda_id": tienda_id, "desde": inicio_mes, "hasta": fin_mes}).mappings().all()
+    """), {"tienda_id": tienda_id, "desde": inicio_mes, "hasta": fin_mes,
+          "tipos_activacion": TIPOS_ACTIVACION_CADENAS}).mappings().all()
 
     conteos = {
         (f["empleado_id"], f["fecha"]): (int(f["subidas"]), int(f["validadas"]))
@@ -360,11 +365,12 @@ def resumen_tiendas(
         FROM venta_chips vc
         JOIN usuarios u ON u.id = vc.empleado_id
         WHERE u.tienda_id = ANY(:ids)
-          AND vc.tipo_chip = 'Activacion'
+          AND UPPER(TRIM(vc.tipo_chip)) = ANY(:tipos_activacion)
           AND COALESCE(vc.cancelada, false) = false
           AND vc.fecha BETWEEN :desde AND :hasta
         GROUP BY u.tienda_id, vc.empleado_id, vc.fecha
-    """), {"ids": ids, "desde": inicio_mes, "hasta": fin_mes}).mappings().all()
+    """), {"ids": ids, "desde": inicio_mes, "hasta": fin_mes,
+          "tipos_activacion": TIPOS_ACTIVACION_CADENAS}).mappings().all()
 
     usuarios = db.execute(text("""
         SELECT id, nombre_completo, activo, tienda_id
