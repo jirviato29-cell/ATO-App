@@ -1,4 +1,6 @@
 import base64
+import io
+import logging
 import os
 import traceback
 from datetime import date, datetime, timedelta
@@ -6,6 +8,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
@@ -15,6 +18,8 @@ from app.database import get_db
 
 ZONA = ZoneInfo("America/Mexico_City")
 
+logger = logging.getLogger(__name__)
+
 
 def _hora_mx_str(dt: datetime) -> str:
     """datetime (cualquier tz) → '9:20 a.m.' en zona México."""
@@ -23,6 +28,45 @@ def _hora_mx_str(dt: datetime) -> str:
     minuto = f"{dt_mx.minute:02d}"
     sufijo = "a.m." if dt_mx.hour < 12 else "p.m."
     return f"{hora}:{minuto} {sufijo}"
+
+
+def sellar_foto(img_bytes: bytes, texto_lineas: List[str]) -> bytes:
+    """Imprime una franja negra semitransparente abajo con el texto en blanco.
+
+    Corrige la orientación EXIF, convierte a RGB y regresa JPEG calidad 85.
+    Usa la fuente incluida en Pillow (load_default), sin archivos externos.
+    """
+    img = Image.open(io.BytesIO(img_bytes))
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
+    ancho, alto = img.size
+
+    tam_letra = max(14, round(ancho * 0.035))
+    fuente = ImageFont.load_default(size=tam_letra)
+    margen = max(8, round(tam_letra * 0.6))
+    interlineado = max(4, round(tam_letra * 0.35))
+
+    medir = ImageDraw.Draw(img)
+    altos = []
+    for linea in texto_lineas:
+        x0, y0, x1, y1 = medir.textbbox((0, 0), linea, font=fuente)
+        altos.append(y1 - y0)
+    alto_franja = sum(altos) + interlineado * (len(texto_lineas) - 1) + margen * 2
+
+    capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    dibujo = ImageDraw.Draw(capa)
+    dibujo.rectangle([(0, alto - alto_franja), (ancho, alto)], fill=(0, 0, 0, 150))
+
+    y = alto - alto_franja + margen
+    for linea, alto_linea in zip(texto_lineas, altos):
+        x0, y0, _, _ = dibujo.textbbox((0, 0), linea, font=fuente)
+        dibujo.text((margen - x0, y - y0), linea, font=fuente, fill=(255, 255, 255, 255))
+        y += alto_linea + interlineado
+
+    img = Image.alpha_composite(img.convert("RGBA"), capa).convert("RGB")
+    salida = io.BytesIO()
+    img.save(salida, format="JPEG", quality=85)
+    return salida.getvalue()
 
 
 router = APIRouter(prefix="/asistencia", tags=["Asistencia"])
@@ -187,7 +231,9 @@ def check_asistencia(
 
     # Subir foto a Supabase Storage
     supabase = _supabase_admin()
-    ts = int(datetime.now(ZONA).timestamp())
+    # Hora oficial del registro: se genera UNA vez y se usa en el sello y en el campo hora
+    ahora = datetime.now(ZONA)
+    ts = int(ahora.timestamp())
     fecha_str = fecha_actual.isoformat()
     filename = f"{current_user.username}_{fecha_str}_{body.tipo}_{ts}.jpg"
 
@@ -215,14 +261,25 @@ def check_asistencia(
             "mensaje": "La foto no se capturó correctamente (imagen demasiado pequeña). Intenta de nuevo.",
         })
 
+    # Sello de hora: si falla, se sube la foto original; el check-in nunca falla por esto
+    try:
+        lineas_sello = [
+            f"{body.tipo.upper()} {ahora.strftime('%d/%m/%Y %H:%M:%S')}",
+            f"{current_user.username} - {modulo.nombre or ''}".rstrip(" -"),
+            f"GPS: {round(distancia)} m de la zona" if distancia is not None else "GPS: zona sin configurar",
+        ]
+        foto_subir = sellar_foto(img_bytes, lineas_sello)
+    except Exception:
+        logger.exception("No se pudo sellar la foto de asistencia %s; se sube la original", filename)
+        foto_subir = img_bytes
+
     supabase.storage.from_("asistencia-fotos").upload(
         path=filename,
-        file=img_bytes,
+        file=foto_subir,
         file_options={"content-type": "image/jpeg", "upsert": "true"},
     )
     foto_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/asistencia-fotos/{filename}"
 
-    ahora = datetime.now(ZONA)
     registro = models.Asistencia(
         usuario_id=current_user.id,
         username=current_user.username,
