@@ -2,7 +2,8 @@
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import date, datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func
@@ -575,7 +576,12 @@ def desactivar_usuario(
 
 
 
-@router.get("/usuarios", response_model=list[schemas.UsuarioResponse])
+# Solo este endpoint expone fecha_ingreso; UsuarioResponse se reutiliza en ventas y no cambia.
+class UsuarioConIngresoResponse(schemas.UsuarioResponse):
+    fecha_ingreso: Optional[date] = None  # pydantic la serializa como "YYYY-MM-DD"
+
+
+@router.get("/usuarios", response_model=list[UsuarioConIngresoResponse])
 def obtener_usuarios(
     db: Session = Depends(get_db),
     current_user: models.Usuario = Depends(

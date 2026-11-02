@@ -44,6 +44,7 @@ class Usuario(Base):
     cuenta_clabe = Column(String, nullable=True)
     cuenta_interbancaria = Column(String, nullable=True)
     nombre_englobado = Column(String(50), nullable=True, index=True)
+    fecha_ingreso = Column(Date, nullable=True)
     jornada_fija = Column(Numeric(5, 2), default=0)
     horario_semanal = Column(JSON, default=list)
     dia_descanso = Column(String(10), nullable=True)
