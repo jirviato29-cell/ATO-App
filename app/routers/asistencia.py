@@ -215,11 +215,17 @@ def check_asistencia(
             "mensaje": "La foto no se capturó correctamente (imagen demasiado pequeña). Intenta de nuevo.",
         })
 
-    supabase.storage.from_("asistencia-fotos").upload(
-        path=filename,
-        file=img_bytes,
-        file_options={"content-type": "image/jpeg", "upsert": "true"},
-    )
+    # Si Supabase Storage tarda o falla, la asistencia se registra de todos modos
+    # (casi siempre el archivo sí queda guardado aunque la respuesta no llegue).
+    try:
+        supabase.storage.from_("asistencia-fotos").upload(
+            path=filename,
+            file=img_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"},
+        )
+    except Exception:
+        traceback.print_exc()
+        print(f"[asistencia] Falló la subida de foto {filename}; se registra la asistencia de todos modos")
     foto_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/asistencia-fotos/{filename}"
 
     ahora = datetime.now(ZONA)
