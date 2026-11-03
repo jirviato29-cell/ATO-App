@@ -204,7 +204,6 @@ def check_asistencia(
             referencia = "promotor"
         # Si no hay coords en tienda ni promotor: dentro_de_zona = True por default
     elif modulo.latitud is not None and modulo.longitud is not None:
-        from app.utils.geo import distancia_metros
         distancia = distancia_metros(body.latitud, body.longitud, modulo.latitud, modulo.longitud)
         dentro_de_zona = distancia <= (modulo.radio_metros or 100)
 
