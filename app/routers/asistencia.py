@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.config import get_current_user
 from app.database import get_db
+from app.utils.geo import distancia_metros
 
 ZONA = ZoneInfo("America/Mexico_City")
 
@@ -167,23 +168,51 @@ def check_asistencia(
 
     dentro_de_zona = True
     distancia = None
+    referencia = None  # Cadenas: "tienda" | "promotor" | None (sin coords)
 
     if is_cadenas_promotor:
+        # Prioridad: coords de la tienda del promotor (usuarios.tienda_id);
+        # respaldo: coords guardadas en el propio promotor.
+        tienda = None
+        if current_user.tienda_id:
+            try:
+                tienda = db.query(models.Tienda).filter(models.Tienda.id == current_user.tienda_id).first()
+            except Exception as e:
+                print(f"[asistencia] error leyendo tienda {current_user.tienda_id}: {e}")
+                db.rollback()  # deja la sesión usable para el INSERT de la asistencia
+                tienda = None
         if (
+            tienda is not None
+            and tienda.latitud is not None
+            and tienda.longitud is not None
+        ):
+            distancia = distancia_metros(
+                body.latitud, body.longitud,
+                tienda.latitud, tienda.longitud,
+            )
+            dentro_de_zona = distancia <= (tienda.radio_metros or 100)
+            referencia = "tienda"
+        elif (
             current_user.latitud_promotor is not None
             and current_user.longitud_promotor is not None
         ):
-            from app.utils.geo import distancia_metros
             distancia = distancia_metros(
                 body.latitud, body.longitud,
                 current_user.latitud_promotor, current_user.longitud_promotor,
             )
             dentro_de_zona = distancia <= (current_user.radio_metros_promotor or 100)
-        # Si no tiene coords configuradas: dentro_de_zona = True por default
+            referencia = "promotor"
+        # Si no hay coords en tienda ni promotor: dentro_de_zona = True por default
     elif modulo.latitud is not None and modulo.longitud is not None:
         from app.utils.geo import distancia_metros
         distancia = distancia_metros(body.latitud, body.longitud, modulo.latitud, modulo.longitud)
         dentro_de_zona = distancia <= (modulo.radio_metros or 100)
+
+    if is_cadenas_promotor:
+        print(
+            f"[asistencia] {current_user.username} {body.tipo}: referencia={referencia or 'sin coords'} "
+            f"distancia={round(distancia) if distancia is not None else '-'} m dentro={dentro_de_zona}"
+        )
 
     # Subir foto a Supabase Storage
     supabase = _supabase_admin()

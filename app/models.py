@@ -79,6 +79,9 @@ class Tienda(Base):
     clave_2 = Column(String(30), nullable=True)
     clave_3 = Column(String(30), nullable=True)
     clave_4 = Column(String(30), nullable=True)
+    latitud = Column(Float, nullable=True)
+    longitud = Column(Float, nullable=True)
+    radio_metros = Column(Integer, default=100)
 
     cadena = relationship("Cadena", backref="tiendas")
 

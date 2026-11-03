@@ -139,6 +139,7 @@ def obtener_cadenas(
 CAMPOS_TIENDA = [
     "cadena_id", "num_tienda", "garantizados",
     "clave_1", "clave_2", "clave_3", "clave_4",
+    "latitud", "longitud", "radio_metros",
 ]
 
 
@@ -315,6 +316,9 @@ def crear_tienda(
         clave_2=tienda.clave_2,
         clave_3=tienda.clave_3,
         clave_4=tienda.clave_4,
+        latitud=tienda.latitud,
+        longitud=tienda.longitud,
+        radio_metros=tienda.radio_metros if tienda.radio_metros is not None else 100,
     )
     db.add(nueva)
     db.commit()

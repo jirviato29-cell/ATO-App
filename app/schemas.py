@@ -426,6 +426,9 @@ class TiendaCreate(BaseModel):
     clave_2: Optional[str] = None
     clave_3: Optional[str] = None
     clave_4: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    radio_metros: Optional[int] = 100
 
 
 class TiendaUpdate(BaseModel):
@@ -438,6 +441,9 @@ class TiendaUpdate(BaseModel):
     clave_2: Optional[str] = None
     clave_3: Optional[str] = None
     clave_4: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    radio_metros: Optional[int] = None
 
 
 class TiendaResponse(BaseModel):
@@ -451,6 +457,9 @@ class TiendaResponse(BaseModel):
     clave_2: Optional[str] = None
     clave_3: Optional[str] = None
     clave_4: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    radio_metros: Optional[int] = None
     cadena: Optional[CadenaResponse] = None
 
     class Config:
