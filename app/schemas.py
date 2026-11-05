@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Dict, List, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import date, datetime, time
 from app.models import EstadoTraspasoEnum, RolEnum
 from typing import Literal
@@ -181,6 +181,11 @@ class UsuarioCreate(BaseModel):
     horario_semanal: Optional[List[Dict]] = []
     dia_descanso: Optional[str] = None
     tienda_id: Optional[int] = None
+    sueldo_base: Optional[float] = None
+    fecha_ingreso: Optional[date] = None
+    asegurado: Optional[bool] = None
+    whatsapp: Optional[str] = Field(None, max_length=15)
+    foto_url: Optional[str] = None
 
 # 👉 Este es para actualizar un usuario
 class UsuarioUpdate(BaseModel):
@@ -200,6 +205,9 @@ class UsuarioUpdate(BaseModel):
     dia_descanso: Optional[str] = None
     tienda_id: Optional[int] = None
     asegurado: Optional[bool] = None
+    fecha_ingreso: Optional[date] = None
+    whatsapp: Optional[str] = Field(None, max_length=15)
+    foto_url: Optional[str] = None
 
 # 👉 Este para devolver la respuesta
 class ModuloOut(BaseModel):

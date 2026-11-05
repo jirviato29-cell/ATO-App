@@ -50,6 +50,8 @@ class Usuario(Base):
     dia_descanso = Column(String(10), nullable=True)
     tienda_id = Column(Integer, ForeignKey("tiendas.id"), nullable=True)
     asegurado = Column(Boolean, default=False, nullable=False)
+    whatsapp = Column(String(15), nullable=True)
+    foto_url = Column(Text, nullable=True)
 
     tienda = relationship("Tienda", backref="usuarios")
 

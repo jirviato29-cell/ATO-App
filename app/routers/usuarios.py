@@ -14,7 +14,9 @@ from app import models, schemas
 from app.config import get_current_user
 from app.database import get_db
 from app.routers.auth import hashear_contraseña
+from app.routers.capturas_telcel import _decodificar_foto, _err, _supabase_admin
 from app.utilidades import verificar_rol_requerido
+from pydantic import BaseModel
 
 
 
@@ -42,8 +44,16 @@ def cifrar_contraseña(password: str):
     return f.encrypt(password.encode()).decode() if f else None
 
 
+# Solo los endpoints de gestión de usuarios exponen estos campos;
+# UsuarioResponse se reutiliza en ventas y no cambia.
+class UsuarioConIngresoResponse(schemas.UsuarioResponse):
+    fecha_ingreso: Optional[date] = None  # pydantic la serializa como "YYYY-MM-DD"
+    whatsapp: Optional[str] = None
+    foto_url: Optional[str] = None
+
+
 # ------------------- REGISTRO -------------------
-@router.post("/registro", response_model=schemas.UsuarioResponse)
+@router.post("/registro", response_model=UsuarioConIngresoResponse)
 def registrar_usuario(
     usuario: schemas.UsuarioCreate,
     db: Session = Depends(get_db),
@@ -88,6 +98,11 @@ def registrar_usuario(
             nombre_englobado=usuario.nombre_englobado or None,
             jornada_fija=usuario.jornada_fija or 0,
             tienda_id=usuario.tienda_id or None,
+            sueldo_base=usuario.sueldo_base or 0,
+            fecha_ingreso=usuario.fecha_ingreso,
+            asegurado=bool(usuario.asegurado),
+            whatsapp=usuario.whatsapp or None,
+            foto_url=usuario.foto_url or None,
         )
         db.add(usuario_nuevo)
         db.commit()
@@ -466,7 +481,7 @@ def verificar_rol(usuario: models.Usuario, roles_permitidos: list[str]):
         )
         
 
-@router.put("/usuarios/{usuario_id}", response_model=schemas.UsuarioResponse)
+@router.put("/usuarios/{usuario_id}", response_model=UsuarioConIngresoResponse)
 def editar_usuario(
     usuario_id: int,
     datos: schemas.UsuarioUpdate,
@@ -520,6 +535,12 @@ def editar_usuario(
             usuario_db.nombre_englobado = datos.nombre_englobado or None
         if datos.jornada_fija is not None:
             usuario_db.jornada_fija = datos.jornada_fija
+        if "fecha_ingreso" in datos.model_fields_set:
+            usuario_db.fecha_ingreso = datos.fecha_ingreso
+        if "whatsapp" in datos.model_fields_set:
+            usuario_db.whatsapp = datos.whatsapp or None
+        if "foto_url" in datos.model_fields_set:
+            usuario_db.foto_url = datos.foto_url or None
 
         db.commit()
         db.refresh(usuario_db)
@@ -534,6 +555,49 @@ def editar_usuario(
         print("================================", file=sys.stderr, flush=True)
         raise HTTPException(status_code=500, detail=f"Error interno: {type(e).__name__}: {str(e)}")
 
+
+class FotoPerfilIn(BaseModel):
+    foto_base64: str
+
+
+# Mismo método que capturas_telcel: se sube desde el backend al bucket
+# "asistencia-fotos" (carpeta perfiles/) y se guarda la URL pública.
+@router.post("/usuarios/{usuario_id}/foto", response_model=UsuarioConIngresoResponse)
+def subir_foto_perfil(
+    usuario_id: int,
+    body: FotoPerfilIn,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(verificar_rol_requerido(models.RolEnum.admin))
+):
+    usuario_db = db.query(models.Usuario).filter_by(id=usuario_id).first()
+    if not usuario_db:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    img_bytes = _decodificar_foto(body.foto_base64)
+
+    ts = int(datetime.now(ZoneInfo("America/Mexico_City")).timestamp())
+    filename = f"perfiles/{usuario_db.username}_{ts}.jpg"
+
+    try:
+        supabase = _supabase_admin()
+        supabase.storage.from_("asistencia-fotos").upload(
+            path=filename,
+            file=img_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        _err("STORAGE_ERROR", "No se pudo guardar la imagen. Intenta de nuevo.", 503)
+
+    usuario_db.foto_url = (
+        f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/"
+        f"asistencia-fotos/{filename}"
+    )
+    db.commit()
+    db.refresh(usuario_db)
+    return usuario_db
 
 
 @router.get("/usuarios/{usuario_id}/password")
@@ -578,11 +642,6 @@ def desactivar_usuario(
 
 
 
-
-
-# Solo este endpoint expone fecha_ingreso; UsuarioResponse se reutiliza en ventas y no cambia.
-class UsuarioConIngresoResponse(schemas.UsuarioResponse):
-    fecha_ingreso: Optional[date] = None  # pydantic la serializa como "YYYY-MM-DD"
 
 
 @router.get("/usuarios", response_model=list[UsuarioConIngresoResponse])
