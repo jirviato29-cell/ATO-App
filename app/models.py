@@ -910,3 +910,20 @@ class DescongelacionComision(Base):
     usuario = relationship("Usuario", foreign_keys=[usuario_id])
     autorizador = relationship("Usuario", foreign_keys=[autorizado_por])
     cancelador = relationship("Usuario", foreign_keys=[cancelado_por])
+
+
+class Vacacion(Base):
+    # Tabla creada a mano en produccion (129 periodos cargados). Solo se mapea:
+    # create_all la omite porque ya existe; no agregar migraciones.
+    __tablename__ = "vacaciones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    clave = Column(String(50), nullable=False)  # nombre_englobado, ej. A17-REGINA
+    fecha_inicio = Column(Date, nullable=False)
+    fecha_fin = Column(Date, nullable=False)
+    dias = Column(Numeric(4, 1))
+    estado = Column(String(20))  # solicitada | autorizada | rechazada | tomada
+    origen = Column(String(20))
+    nota = Column(Text)
+    creado_por = Column(Integer)
+    creado_at = Column(DateTime(timezone=True))
