@@ -927,3 +927,14 @@ class Vacacion(Base):
     nota = Column(Text)
     creado_por = Column(Integer)
     creado_at = Column(DateTime(timezone=True))
+    tipo = Column(String(30), default="vacaciones")  # vacaciones | falta_injustificada
+    aprobado_rh = Column(Boolean)
+    aprobado_rh_por = Column(Integer)
+    aprobado_rh_at = Column(DateTime(timezone=True))
+    aprobado_encargado = Column(Boolean)
+    aprobado_encargado_por = Column(Integer)
+    aprobado_encargado_at = Column(DateTime(timezone=True))
+    aprobado_gerencia = Column(Boolean)
+    aprobado_gerencia_por = Column(Integer)
+    aprobado_gerencia_at = Column(DateTime(timezone=True))
+    cubre_clave = Column(String(50))  # nombre_englobado de quien cubre
