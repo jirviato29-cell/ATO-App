@@ -6,7 +6,7 @@ from .database import Base
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy import ForeignKey
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 
 
@@ -200,6 +200,8 @@ class Venta(Base):
     fecha_devolucion = Column(Date, nullable=True)
     monto_devuelto = Column(Float, nullable=True)
     devuelta_por = Column(Integer, nullable=True)
+    promocion = Column(String(30), nullable=True)
+    precio_original = Column(Float, nullable=True)
 
     empleado = relationship("Usuario", back_populates="ventas")
     comision_obj = relationship("Comision")
@@ -308,6 +310,19 @@ class CorreoPromocional(Base):
     id = Column(Integer, primary_key=True, index=True)
     correo = Column(String, unique=True, nullable=False)
     fecha_registro = Column(DateTime, default=datetime.utcnow)
+
+
+class Promocion(Base):
+    # La tabla ya existe en la BD; este modelo solo la mapea.
+    __tablename__ = "promociones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    codigo = Column(String, nullable=False)
+    nombre = Column(String, nullable=False)
+    activa = Column(Boolean, nullable=False, default=False)
+    fecha_inicio = Column(Date, nullable=True)
+    fecha_fin = Column(Date, nullable=True)
+    claves = Column(ARRAY(String), nullable=True)
 
 
 

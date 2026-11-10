@@ -12,6 +12,7 @@ from app.utilidades import calcular_comision_telefono, enviar_ticket, mismo_foli
 from datetime import date
 from app.routers.kardex import registrar_kardex
 from app.routers.planes_tarifarios import revertir_plan
+from app.routers.promociones import preparar_renglones_promocion
 import os
 from supabase import create_client
 
@@ -802,6 +803,13 @@ def crear_ventas_multiples(
     # calcular la fecha/hora una sola vez (evita inconsistencias por zona horaria)
     fecha_actual = datetime.now(zona_horaria)
 
+    # Promociones: solo si algun producto trae promocion. El backend recalcula
+    # precios desde inventario general y puede partir renglones por precio.
+    if any(p.promocion for p in venta.productos):
+        renglones = preparar_renglones_promocion(db, venta, current_user)
+    else:
+        renglones = [(p, None, None) for p in venta.productos]
+
     # Si el request trae un folio (ej. segunda llamada de pago dividido), reusarlo.
     # Si no, generar uno nuevo (excepto Cadenas id=7).
     if venta.folio:
@@ -812,7 +820,7 @@ def crear_ventas_multiples(
     else:
         folio_venta = None
 
-    for item in venta.productos:
+    for item, precio_original, codigo_promo in renglones:
         com = (
             db.query(models.Comision)
             .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
@@ -867,6 +875,8 @@ def crear_ventas_multiples(
             folio=folio_venta,
             imei=item.imei,
             clasificacion=item.clasificacion,
+            promocion=codigo_promo,
+            precio_original=precio_original,
         )
 
         db.add(nueva)

@@ -15,6 +15,7 @@ from app.routers import cadenas_ventas
 from app.routers import metas
 from app.routers import metas_cadenas
 from app.routers import vacaciones
+from app.routers import promociones
 from fastapi.middleware.cors import CORSMiddleware
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
@@ -74,3 +75,4 @@ app.include_router(cadenas_ventas.router, prefix="/ventas-cadenas", tags=["Venta
 app.include_router(metas.router, prefix="/api/metas", tags=["Metas"])
 app.include_router(metas_cadenas.router, prefix="/metas-cadenas", tags=["Metas Cadenas"])
 app.include_router(vacaciones.router, prefix="/vacaciones", tags=["Vacaciones"])
+app.include_router(promociones.router, prefix="/promociones", tags=["Promociones"])
