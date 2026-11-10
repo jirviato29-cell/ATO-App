@@ -323,6 +323,7 @@ class Promocion(Base):
     fecha_inicio = Column(Date, nullable=True)
     fecha_fin = Column(Date, nullable=True)
     claves = Column(ARRAY(String), nullable=True)
+    solo_modulos = Column(ARRAY(Integer), nullable=True)  # null = aplica en todos los módulos
 
 
 

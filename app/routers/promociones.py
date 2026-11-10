@@ -44,15 +44,27 @@ def _modulo_id(usuario: models.Usuario) -> Optional[int]:
     return usuario.modulo.id if usuario.modulo else usuario.modulo_id
 
 
+def aplica_en_modulo(promo: models.Promocion, modulo_id: Optional[int]) -> bool:
+    """solo_modulos null = todos los módulos; si trae lista, solo esos."""
+    if promo.solo_modulos is None:
+        return True
+    return modulo_id is not None and modulo_id in promo.solo_modulos
+
+
 @router.get("/activas")
 def promociones_activas(
     db: Session = Depends(get_db),
     current_user: models.Usuario = Depends(get_current_user),
 ):
-    if _modulo_id(current_user) == MODULO_CADENAS:
+    modulo_id = _modulo_id(current_user)
+    if modulo_id == MODULO_CADENAS:
         return []
     promos = _query_vigentes(db, hoy_mx()).order_by(models.Promocion.id).all()
-    return [{"codigo": p.codigo, "nombre": p.nombre, "claves": p.claves or []} for p in promos]
+    return [
+        {"codigo": p.codigo, "nombre": p.nombre, "claves": p.claves or []}
+        for p in promos
+        if aplica_en_modulo(p, modulo_id)
+    ]
 
 
 # ── Calculo de precios ────────────────────────────────────────────────────────
@@ -136,6 +148,8 @@ def preparar_renglones_promocion(
     promo = promo_vigente(db, codigo)
     if not promo:
         rechazar(f"La promoción {codigo} no existe o no está activa hoy.")
+    if not aplica_en_modulo(promo, _modulo_id(current_user)):
+        rechazar("La promoción no aplica en este módulo.")
 
     renglones = []
     for idx, item in con_promo:
