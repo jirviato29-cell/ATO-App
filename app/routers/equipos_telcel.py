@@ -10,8 +10,13 @@ from typing import Optional
 
 from app import models
 from app.database import get_db
+from app.utilidades import verificar_rol_requerido
 
 router = APIRouter()
+
+# Alta, edición y surtido de IMEIs: solo admin. Los GET quedan como estaban
+# (los usa la pantalla de venta de teléfonos).
+SOLO_ADMIN = verificar_rol_requerido(models.RolEnum.admin)
 
 
 class MarcarSurtidosRequest(BaseModel):
@@ -67,7 +72,8 @@ class EditarChipCasadoRequest(BaseModel):
 @router.post("/upload/")
 def upload_equipos_telcel(
     archivo: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(SOLO_ADMIN)
 ):
     # 1️⃣ Leer el Excel
     try:
@@ -291,7 +297,7 @@ def buscar_por_imei(imei: str, db: Session = Depends(get_db)):
 
 
 @router.post("/marcar-surtidos")
-def marcar_surtidos(data: MarcarSurtidosRequest, db: Session = Depends(get_db)):
+def marcar_surtidos(data: MarcarSurtidosRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     if not data.imeis:
         return {"status": "success", "marcados": 0, "no_encontrados": [], "ya_surtidos": []}
 
@@ -407,7 +413,7 @@ def _fecha_entrada_real(db, producto: str, modulo_id: int):
 
 
 @router.post("/alta-individual")
-def alta_individual(data: AltaIndividualRequest, db: Session = Depends(get_db)):
+def alta_individual(data: AltaIndividualRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     imei = data.imei.strip()
     if not imei:
         raise HTTPException(status_code=400, detail="El IMEI no puede estar vacío")
@@ -433,7 +439,7 @@ def alta_individual(data: AltaIndividualRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/alta-multiple")
-def alta_multiple(data: AltaMultipleRequest, db: Session = Depends(get_db)):
+def alta_multiple(data: AltaMultipleRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     if not data.equipos:
         return {"status": "success", "guardados": 0, "errores": []}
     ahora = datetime.now(ZoneInfo("America/Mexico_City")).replace(tzinfo=None)
@@ -466,7 +472,7 @@ def alta_multiple(data: AltaMultipleRequest, db: Session = Depends(get_db)):
 ESTADOS_ACTIVACION = ("no_activado", "activado", "libre", "bloqueado")
 
 @router.post("/activar/{equipo_id}")
-def cambiar_activacion(equipo_id: int, data: CambiarActivacionRequest, db: Session = Depends(get_db)):
+def cambiar_activacion(equipo_id: int, data: CambiarActivacionRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
@@ -492,7 +498,7 @@ def cambiar_activacion(equipo_id: int, data: CambiarActivacionRequest, db: Sessi
 
 
 @router.post("/alta-bodega")
-def alta_bodega(data: AltaBodegaRequest, db: Session = Depends(get_db)):
+def alta_bodega(data: AltaBodegaRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     imei = data.imei.strip()
     if not imei:
         raise HTTPException(status_code=400, detail="El IMEI no puede estar vacío")
@@ -525,7 +531,7 @@ def alta_bodega(data: AltaBodegaRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/editar-imei/{equipo_id}")
-def editar_imei(equipo_id: int, data: EditarImeiRequest, db: Session = Depends(get_db)):
+def editar_imei(equipo_id: int, data: EditarImeiRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
@@ -547,7 +553,7 @@ def editar_imei(equipo_id: int, data: EditarImeiRequest, db: Session = Depends(g
 
 
 @router.post("/fecha-activacion/{equipo_id}")
-def set_fecha_activacion(equipo_id: int, data: FechaActivacionRequest, db: Session = Depends(get_db)):
+def set_fecha_activacion(equipo_id: int, data: FechaActivacionRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
@@ -565,7 +571,7 @@ def set_fecha_activacion(equipo_id: int, data: FechaActivacionRequest, db: Sessi
 
 
 @router.post("/fecha-estatus-inicial/{equipo_id}")
-def set_fecha_estatus_inicial(equipo_id: int, data: FechaEstatusInicialRequest, db: Session = Depends(get_db)):
+def set_fecha_estatus_inicial(equipo_id: int, data: FechaEstatusInicialRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
@@ -583,7 +589,7 @@ def set_fecha_estatus_inicial(equipo_id: int, data: FechaEstatusInicialRequest, 
 
 
 @router.post("/cumple-arl/{equipo_id}")
-def set_cumple_arl(equipo_id: int, data: CumpleArlRequest, db: Session = Depends(get_db)):
+def set_cumple_arl(equipo_id: int, data: CumpleArlRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
@@ -595,7 +601,7 @@ def set_cumple_arl(equipo_id: int, data: CumpleArlRequest, db: Session = Depends
 # Vive en el router de equipos pero escribe en ventas: chip_casado es la fuente
 # de la columna "Numero" que se muestra en la pantalla de equipos.
 @router.post("/editar-chip-casado/{equipo_id}")
-def editar_chip_casado(equipo_id: int, data: EditarChipCasadoRequest, db: Session = Depends(get_db)):
+def editar_chip_casado(equipo_id: int, data: EditarChipCasadoRequest, db: Session = Depends(get_db), _admin: models.Usuario = Depends(SOLO_ADMIN)):
     equipo = db.query(models.EquiposTelcel).filter(models.EquiposTelcel.id == equipo_id).first()
     if not equipo:
         raise HTTPException(status_code=404, detail="Equipo no encontrado")
