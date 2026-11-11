@@ -50,7 +50,7 @@ def _registrar_renglon_telefono(
     Normal: comision, descuento de inventario, kardex y marca del IMEI como
     vendido, respetando skip_comision / skip_inventario / imei del item.
     parte_tarjeta=True (pago dividido): fila sin comision, sin inventario, sin
-    kardex, sin IMEI, sin tipo_venta y sin chip_casado, para que ni la comision
+    kardex, sin IMEI, sin tipo_venta, sin chip_casado y sin clasificacion, para que ni la comision
     del telefono ni su chip se cuenten dos veces.
     """
     precio = item.precio_unitario if precio_unitario is None else precio_unitario
@@ -59,6 +59,7 @@ def _registrar_renglon_telefono(
     imei = None if parte_tarjeta else item.imei
     tipo_venta = None if parte_tarjeta else item.tipo_venta
     chip_casado = None if parte_tarjeta else item.chip_casado
+    clasificacion = None if parte_tarjeta else item.clasificacion
 
     q_com = db.query(models.Comision).filter(
         func.lower(models.Comision.producto) == item.producto.strip().lower()
@@ -111,7 +112,7 @@ def _registrar_renglon_telefono(
         telefono_cliente=telefono_cliente,
         folio=folio,
         imei=imei,
-        clasificacion=item.clasificacion,
+        clasificacion=clasificacion,
     )
     db.add(nueva)
     db.flush()
