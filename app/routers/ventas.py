@@ -833,23 +833,26 @@ def crear_ventas_multiples(
         modulo_id = current_user.modulo.id
         verificar_modulo_no_congelado(db, modulo_id)
 
-        inventario = (
-            db.query(models.InventarioModulo)
-            .filter(
-                models.InventarioModulo.modulo_id == modulo_id,
-                models.InventarioModulo.producto == item.producto
+        # skip_inventario (2a peticion del pago dividido): la pieza ya se desconto
+        # en la parte de efectivo; no restar inventario ni escribir kardex otra vez.
+        if not item.skip_inventario:
+            inventario = (
+                db.query(models.InventarioModulo)
+                .filter(
+                    models.InventarioModulo.modulo_id == modulo_id,
+                    models.InventarioModulo.producto == item.producto
+                )
+                .first()
             )
-            .first()
-        )
 
-        if not inventario:
-            raise HTTPException(status_code=400, detail=f"No hay inventario para el producto: {item.producto}")
+            if not inventario:
+                raise HTTPException(status_code=400, detail=f"No hay inventario para el producto: {item.producto}")
 
-        if inventario.cantidad < item.cantidad:
-            raise HTTPException(status_code=400, detail=f"Inventario insuficiente para el producto: {item.producto}")
+            if inventario.cantidad < item.cantidad:
+                raise HTTPException(status_code=400, detail=f"Inventario insuficiente para el producto: {item.producto}")
 
-        # disminuir inventario
-        inventario.cantidad -= item.cantidad
+            # disminuir inventario
+            inventario.cantidad -= item.cantidad
 
         # detectar tipo de producto buscando la palabra TELEFONO en cualquier parte
         tipo_producto = (
@@ -882,16 +885,17 @@ def crear_ventas_multiples(
         db.add(nueva)
         db.flush()
 
-        registrar_kardex(
-            db=db,
-            producto=nueva.producto,
-            tipo_producto=nueva.tipo_producto,
-            cantidad=nueva.cantidad,
-            tipo_movimiento="VENTA",
-            usuario_id=current_user.id,
-            modulo_origen_id=modulo_id,
-            referencia_id=nueva.id
-        )
+        if not item.skip_inventario:
+            registrar_kardex(
+                db=db,
+                producto=nueva.producto,
+                tipo_producto=nueva.tipo_producto,
+                cantidad=nueva.cantidad,
+                tipo_movimiento="VENTA",
+                usuario_id=current_user.id,
+                modulo_origen_id=modulo_id,
+                referencia_id=nueva.id
+            )
 
         ventas_realizadas.append(nueva)
 
