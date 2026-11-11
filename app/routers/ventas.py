@@ -530,6 +530,43 @@ def resumen_ventas(db: Session = Depends(get_db)):
     
     
 
+def _venta_desconto_inventario(db: Session, venta: models.Venta) -> bool:
+    """True si este renglon de venta desconto inventario al registrarse.
+
+    Se decide por su movimiento VENTA en kardex_movimientos (referencia_id = id
+    de la venta). Se filtra tambien por producto y modulo porque los planes
+    tarifarios escriben VENTA con referencia_id = id del plan, que puede
+    coincidir con el id de una venta. El renglon en tarjeta de un pago dividido
+    no tiene ese movimiento: no se le regresa inventario, kardex ni IMEI.
+
+    Ventas anteriores al primer movimiento VENTA del kardex (de antes de que
+    existiera) se tratan como antes: si descontaron inventario.
+    """
+    tiene_venta = (
+        db.query(models.KardexMovimiento.id)
+        .filter(
+            models.KardexMovimiento.referencia_id == venta.id,
+            models.KardexMovimiento.tipo_movimiento == models.TipoMovimientoEnum.VENTA,
+            models.KardexMovimiento.producto == venta.producto,
+            models.KardexMovimiento.modulo_origen_id == venta.modulo_id,
+        )
+        .first()
+    )
+    if tiene_venta:
+        return True
+
+    primer_kardex = (
+        db.query(func.min(models.KardexMovimiento.fecha))
+        .filter(models.KardexMovimiento.tipo_movimiento == models.TipoMovimientoEnum.VENTA)
+        .scalar()
+    )
+    if primer_kardex is not None and venta.fecha is not None:
+        primer_dia = primer_kardex.date() if hasattr(primer_kardex, "date") else primer_kardex
+        if venta.fecha < primer_dia:
+            return True
+    return False
+
+
 @router.put("/ventas/{venta_id}/cancelar", response_model=schemas.VentaResponse)
 def cancelar_venta(
     venta_id: int,
@@ -592,76 +629,84 @@ def cancelar_venta(
         db.refresh(venta)
         return venta
 
-    # Reintegrar inventario — lookup por clave para evitar duplicados por variación de nombre
-    prod_general = (
-        db.query(models.InventarioGeneral)
-        .filter(models.InventarioGeneral.producto == venta.producto)
-        .first()
-    )
-    inventario = None
-    if prod_general:
-        inventario = (
-            db.query(models.InventarioModulo)
-            .filter(
-                models.InventarioModulo.clave     == prod_general.clave,
-                models.InventarioModulo.modulo_id == venta.modulo_id
+    # Solo si este renglon desconto inventario (tiene kardex VENTA). El renglon
+    # en tarjeta de un pago dividido no lo tiene: solo se marca.
+    desconto = _venta_desconto_inventario(db, venta)
+    if desconto:
+        # Reintegrar inventario — lookup por clave para evitar duplicados por variación de nombre
+        prod_general = (
+            db.query(models.InventarioGeneral)
+            .filter(models.InventarioGeneral.producto == venta.producto)
+            .first()
+        )
+        inventario = None
+        if prod_general:
+            inventario = (
+                db.query(models.InventarioModulo)
+                .filter(
+                    models.InventarioModulo.clave     == prod_general.clave,
+                    models.InventarioModulo.modulo_id == venta.modulo_id
+                )
+                .first()
             )
-            .first()
-        )
-    if not inventario:
-        # Fallback: intentar por nombre exacto
-        inventario = (
-            db.query(models.InventarioModulo)
-            .filter(
-                models.InventarioModulo.producto  == venta.producto,
-                models.InventarioModulo.modulo_id == venta.modulo_id
+        if not inventario:
+            # Fallback: intentar por nombre exacto
+            inventario = (
+                db.query(models.InventarioModulo)
+                .filter(
+                    models.InventarioModulo.producto  == venta.producto,
+                    models.InventarioModulo.modulo_id == venta.modulo_id
+                )
+                .first()
             )
-            .first()
-        )
 
-    if inventario:
-        inventario.cantidad += venta.cantidad
-    else:
-        print(
-            f"[ALERTA cancelación] Venta {venta.id} (producto '{venta.producto}', "
-            f"módulo {venta.modulo_id}) no tiene fila en inventario_modulo. "
-            f"Stock NO devuelto, revisar manualmente."
-        )
-
-    # Revertir equipo Telcel a surtido (solo si la venta trae IMEI)
-    if venta.tipo_producto == "telefono" and venta.imei:
-        imei_limpio = str(venta.imei).strip()
-        equipo = (
-            db.query(models.EquiposTelcel)
-            .filter(models.EquiposTelcel.imei == imei_limpio)
-            .first()
-        )
-        if equipo and mismo_folio(equipo.folio_venta, venta.folio):
-            equipo.estatus = "surtido"
-            equipo.fecha_venta = None
-            equipo.folio_venta = None
+        if inventario:
+            inventario.cantidad += venta.cantidad
         else:
             print(
-                f"[ALERTA cancelacion IMEI] Venta {venta.id} folio {venta.folio} "
-                f"imei '{venta.imei}': equipo no encontrado o folio_venta no coincide. "
-                f"IMEI NO revertido, revisar manualmente."
+                f"[ALERTA cancelación] Venta {venta.id} (producto '{venta.producto}', "
+                f"módulo {venta.modulo_id}) no tiene fila en inventario_modulo. "
+                f"Stock NO devuelto, revisar manualmente."
             )
+
+        # Revertir equipo Telcel a surtido (solo si la venta trae IMEI)
+        if venta.tipo_producto == "telefono" and venta.imei:
+            imei_limpio = str(venta.imei).strip()
+            equipo = (
+                db.query(models.EquiposTelcel)
+                .filter(models.EquiposTelcel.imei == imei_limpio)
+                .first()
+            )
+            if equipo and mismo_folio(equipo.folio_venta, venta.folio):
+                equipo.estatus = "surtido"
+                equipo.fecha_venta = None
+                equipo.folio_venta = None
+            else:
+                print(
+                    f"[ALERTA cancelacion IMEI] Venta {venta.id} folio {venta.folio} "
+                    f"imei '{venta.imei}': equipo no encontrado o folio_venta no coincide. "
+                    f"IMEI NO revertido, revisar manualmente."
+                )
+    else:
+        print(f"[cancelacion] Venta {venta.id} folio {venta.folio}: sin kardex VENTA, "
+              f"no se regresa inventario ni IMEI.")
 
     # Marcar cancelada
     venta.cancelada = True
 
     # 🔥 Registrar Kardex (ENTRADA por cancelación)
-    registrar_kardex(
-        db=db,
-        producto=venta.producto,
-        tipo_producto=venta.tipo_producto,
-        cantidad=venta.cantidad,
-        tipo_movimiento="CANCELACION_VENTA",
-        usuario_id=current_user.id,
-        modulo_origen_id=None,
-        modulo_destino_id=venta.modulo_id,
-        referencia_id=venta.id
-    )
+    if desconto:
+        registrar_kardex(
+            db=db,
+            producto=venta.producto,
+            tipo_producto=venta.tipo_producto,
+            cantidad=venta.cantidad,
+            tipo_movimiento="CANCELACION_VENTA",
+            usuario_id=current_user.id,
+            modulo_origen_id=None,
+            modulo_destino_id=venta.modulo_id,
+            referencia_id=venta.id
+        )
 
     db.commit()
     db.refresh(venta)
@@ -705,57 +750,64 @@ def devolver_venta(
 
     hoy = datetime.now(zona_horaria).date()
 
-    # Reintegrar inventario
-    prod_general = (
-        db.query(models.InventarioGeneral)
-        .filter(models.InventarioGeneral.producto == venta.producto)
-        .first()
-    )
-    inventario = None
-    if prod_general:
-        inventario = (
-            db.query(models.InventarioModulo)
-            .filter(
-                models.InventarioModulo.clave == prod_general.clave,
-                models.InventarioModulo.modulo_id == venta.modulo_id
+    # Solo si este renglon desconto inventario (tiene kardex VENTA). El renglon
+    # en tarjeta de un pago dividido no lo tiene: solo se marca.
+    desconto = _venta_desconto_inventario(db, venta)
+    if desconto:
+        # Reintegrar inventario
+        prod_general = (
+            db.query(models.InventarioGeneral)
+            .filter(models.InventarioGeneral.producto == venta.producto)
+            .first()
+        )
+        inventario = None
+        if prod_general:
+            inventario = (
+                db.query(models.InventarioModulo)
+                .filter(
+                    models.InventarioModulo.clave == prod_general.clave,
+                    models.InventarioModulo.modulo_id == venta.modulo_id
+                )
+                .first()
             )
-            .first()
-        )
-    if not inventario:
-        inventario = (
-            db.query(models.InventarioModulo)
-            .filter(
-                models.InventarioModulo.producto == venta.producto,
-                models.InventarioModulo.modulo_id == venta.modulo_id
+        if not inventario:
+            inventario = (
+                db.query(models.InventarioModulo)
+                .filter(
+                    models.InventarioModulo.producto == venta.producto,
+                    models.InventarioModulo.modulo_id == venta.modulo_id
+                )
+                .first()
             )
-            .first()
-        )
 
-    if inventario:
-        inventario.cantidad += venta.cantidad
-    else:
-        print(
-            f"[ALERTA devolucion] Venta {venta.id} producto '{venta.producto}' "
-            f"modulo {venta.modulo_id}: sin fila en inventario_modulo. Stock NO devuelto."
-        )
-
-    # Revertir IMEI si es telefono
-    if venta.tipo_producto == "telefono" and venta.imei:
-        imei_limpio = str(venta.imei).strip()
-        equipo = (
-            db.query(models.EquiposTelcel)
-            .filter(models.EquiposTelcel.imei == imei_limpio)
-            .first()
-        )
-        if equipo and mismo_folio(equipo.folio_venta, venta.folio):
-            equipo.estatus = "surtido"
-            equipo.fecha_venta = None
-            equipo.folio_venta = None
+        if inventario:
+            inventario.cantidad += venta.cantidad
         else:
             print(
-                f"[ALERTA devolucion IMEI] Venta {venta.id} folio {venta.folio} "
-                f"imei '{venta.imei}': no revertido, revisar manualmente."
+                f"[ALERTA devolucion] Venta {venta.id} producto '{venta.producto}' "
+                f"modulo {venta.modulo_id}: sin fila en inventario_modulo. Stock NO devuelto."
             )
+
+        # Revertir IMEI si es telefono
+        if venta.tipo_producto == "telefono" and venta.imei:
+            imei_limpio = str(venta.imei).strip()
+            equipo = (
+                db.query(models.EquiposTelcel)
+                .filter(models.EquiposTelcel.imei == imei_limpio)
+                .first()
+            )
+            if equipo and mismo_folio(equipo.folio_venta, venta.folio):
+                equipo.estatus = "surtido"
+                equipo.fecha_venta = None
+                equipo.folio_venta = None
+            else:
+                print(
+                    f"[ALERTA devolucion IMEI] Venta {venta.id} folio {venta.folio} "
+                    f"imei '{venta.imei}': no revertido, revisar manualmente."
+                )
+    else:
+        print(f"[devolucion] Venta {venta.id} folio {venta.folio}: sin kardex VENTA, "
+              f"no se regresa inventario ni IMEI.")
 
     # Marcar la venta
     venta.devuelta = True
@@ -777,17 +829,18 @@ def devolver_venta(
     )
     db.add(dev)
 
-    registrar_kardex(
-        db=db,
-        producto=venta.producto,
-        tipo_producto=venta.tipo_producto,
-        cantidad=venta.cantidad,
-        tipo_movimiento="DEVOLUCION",
-        usuario_id=current_user.id,
-        modulo_origen_id=None,
-        modulo_destino_id=venta.modulo_id,
-        referencia_id=venta.id
-    )
+    if desconto:
+        registrar_kardex(
+            db=db,
+            producto=venta.producto,
+            tipo_producto=venta.tipo_producto,
+            cantidad=venta.cantidad,
+            tipo_movimiento="DEVOLUCION",
+            usuario_id=current_user.id,
+            modulo_origen_id=None,
+            modulo_destino_id=venta.modulo_id,
+            referencia_id=venta.id
+        )
 
     db.commit()
     db.refresh(venta)
