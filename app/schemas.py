@@ -309,11 +309,17 @@ class ProductoEnVenta(BaseModel):
     clave: Optional[str] = None
     promocion: Optional[str] = None
 
+class PagoDividido(BaseModel):
+    efectivo: float
+    tarjeta: float
+
 class VentaMultipleCreate(BaseModel):
     productos: List[ProductoEnVenta]
     telefono_cliente: Optional[str] = None
     metodo_pago: str
     folio: Optional[str] = None
+    # Solo /ventas/multiples: parte cada renglon en una fila efectivo y una tarjeta
+    pago_dividido: Optional[PagoDividido] = None
 
 class VentaChipCreate(BaseModel):
     tipo_chip: str

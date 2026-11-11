@@ -31,6 +31,184 @@ router = APIRouter()
 zona_horaria = ZoneInfo("America/Mexico_City")
 
 
+def _registrar_renglon_telefono(
+    db: Session,
+    item,
+    *,
+    usuario: models.Usuario,
+    modulo_id: int,
+    metodo_pago: str,
+    folio: Optional[str],
+    telefono_cliente: Optional[str],
+    fecha_actual: datetime,
+    precio_unitario: Optional[float] = None,
+    parte_tarjeta: bool = False,
+    solo_comision_activa: bool = False,
+) -> models.Venta:
+    """Agrega (flush, sin commit) la fila de venta de un telefono.
+
+    Normal: comision, descuento de inventario, kardex y marca del IMEI como
+    vendido, respetando skip_comision / skip_inventario / imei del item.
+    parte_tarjeta=True (pago dividido): fila sin comision, sin inventario, sin
+    kardex, sin IMEI y sin tipo_venta, para que la comision del telefono no
+    se cuente dos veces.
+    """
+    precio = item.precio_unitario if precio_unitario is None else precio_unitario
+    skip_comision = parte_tarjeta or item.skip_comision
+    skip_inventario = parte_tarjeta or item.skip_inventario
+    imei = None if parte_tarjeta else item.imei
+    tipo_venta = None if parte_tarjeta else item.tipo_venta
+
+    q_com = db.query(models.Comision).filter(
+        func.lower(models.Comision.producto) == item.producto.strip().lower()
+    )
+    if solo_comision_activa:
+        q_com = q_com.filter(models.Comision.activo == True)
+    com = q_com.first()
+    comision_id = None if skip_comision else (com.id if com else None)
+    comision_monto = None if skip_comision else (com.cantidad if com else None)
+    verificar_modulo_no_congelado(db, modulo_id)
+
+    if not skip_inventario:
+        inventario = (
+            db.query(models.InventarioModulo)
+            .filter(
+                models.InventarioModulo.modulo_id == modulo_id,
+                models.InventarioModulo.producto == item.producto,
+                models.InventarioModulo.tipo_producto == item.tipo_producto
+            )
+            .first()
+        )
+        if not inventario:
+            raise HTTPException(400, f"No hay inventario para {item.producto}")
+        if inventario.cantidad < item.cantidad:
+            raise HTTPException(400, f"Inventario insuficiente para {item.producto}")
+        inventario.cantidad -= item.cantidad
+
+    if not item.chip_casado:
+        raise HTTPException(
+            status_code=400,
+            detail=f"chip_casado es obligatorio para teléfonos: {item.producto}"
+        )
+
+    nueva = models.Venta(
+        empleado_id=usuario.id,
+        modulo_id=modulo_id,
+        producto=item.producto,
+        cantidad=item.cantidad,
+        precio_unitario=precio,
+        tipo_producto=item.tipo_producto,
+        tipo_venta=tipo_venta,
+        metodo_pago=metodo_pago,
+        total=precio * item.cantidad,
+        cancelada=False,
+        comision_id=comision_id,
+        comision_monto=comision_monto,
+        chip_casado=item.chip_casado,
+        fecha=fecha_actual.date(),
+        hora=fecha_actual.time(),
+        telefono_cliente=telefono_cliente,
+        folio=folio,
+        imei=imei,
+        clasificacion=item.clasificacion,
+    )
+    db.add(nueva)
+    db.flush()
+
+    if not skip_inventario:
+        registrar_kardex(
+            db=db,
+            producto=nueva.producto,
+            tipo_producto=nueva.tipo_producto,
+            cantidad=nueva.cantidad,
+            tipo_movimiento="VENTA",
+            usuario_id=usuario.id,
+            modulo_origen_id=modulo_id,
+            referencia_id=nueva.id
+        )
+
+    # Validar y marcar equipo Telcel como vendido (solo si el teléfono trae imei)
+    if imei:
+        imei_limpio = str(imei).strip()
+        equipo = (
+            db.query(models.EquiposTelcel)
+            .filter(models.EquiposTelcel.imei == imei_limpio)
+            .first()
+        )
+        if not equipo:
+            raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no está registrado")
+        if equipo.estatus == "vendido":
+            raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} ya fue vendido")
+        if equipo.estatus != "surtido":
+            raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no está surtido a un módulo (estatus: {equipo.estatus})")
+        if equipo.modulo_id != modulo_id:
+            raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no pertenece a este módulo")
+        equipo.estatus = "vendido"
+        equipo.fecha_venta = fecha_actual.replace(tzinfo=None)
+        equipo.folio_venta = folio
+
+    return nueva
+
+
+def _sumar_a_corte(db: Session, modulo_id: int, fecha_corte: date, ventas: list) -> None:
+    """Suma las ventas al CorteDia del módulo/fecha (lo crea si no existe). Sin commit."""
+    corte = db.query(models.CorteDia).filter(
+        models.CorteDia.fecha == fecha_corte,
+        models.CorteDia.modulo_id == modulo_id
+    ).first()
+
+    if not corte:
+        corte = models.CorteDia(
+            fecha=fecha_corte,
+            modulo_id=modulo_id,
+            total_efectivo=0.0,
+            total_tarjeta=0.0,
+            adicional_recargas=0.0,
+            adicional_transporte=0.0,
+            adicional_otros=0.0,
+            total_sistema=0.0,
+            total_general=0.0,
+            accesorios_efectivo=0.0,
+            accesorios_tarjeta=0.0,
+            accesorios_total=0.0,
+            telefonos_efectivo=0.0,
+            telefonos_tarjeta=0.0,
+            telefonos_total=0.0
+        )
+        db.add(corte)
+        db.flush()
+
+    suma_request = 0.0
+    for v in ventas:
+        pago = (v.metodo_pago or "").strip().lower()
+        es_efectivo = pago == "efectivo" or pago == "cash"
+        total_v = float(v.total or 0)
+
+        if es_efectivo:
+            corte.total_efectivo = (corte.total_efectivo or 0) + total_v
+            if v.tipo_producto == "accesorios":
+                corte.accesorios_efectivo = (corte.accesorios_efectivo or 0) + total_v
+            else:
+                corte.telefonos_efectivo = (corte.telefonos_efectivo or 0) + total_v
+        else:
+            # todo lo que no sea "efectivo" se acumula en tarjeta
+            corte.total_tarjeta = (corte.total_tarjeta or 0) + total_v
+            if v.tipo_producto == "accesorios":
+                corte.accesorios_tarjeta = (corte.accesorios_tarjeta or 0) + total_v
+            else:
+                corte.telefonos_tarjeta = (corte.telefonos_tarjeta or 0) + total_v
+
+        if v.tipo_producto == "accesorios":
+            corte.accesorios_total = (corte.accesorios_total or 0) + total_v
+        else:
+            corte.telefonos_total = (corte.telefonos_total or 0) + total_v
+
+        corte.total_sistema = (corte.total_sistema or 0) + total_v
+        suma_request += total_v
+
+    corte.total_general = (corte.total_general or 0) + suma_request
+
+
 @router.post("/ventas", response_model=List[schemas.VentaResponse])
 def crear_ventas(
     venta: schemas.VentaMultipleCreate,
@@ -50,6 +228,20 @@ def crear_ventas(
         folio_venta = None
 
     for item in venta.productos:
+        if item.tipo_producto == "telefono":
+            fecha_actual = datetime.now(zona_horaria)
+            nueva = _registrar_renglon_telefono(
+                db, item,
+                usuario=current_user,
+                modulo_id=current_user.modulo_id,
+                metodo_pago=venta.metodo_pago,
+                folio=folio_venta,
+                telefono_cliente=venta.telefono_cliente,
+                fecha_actual=fecha_actual,
+            )
+            ventas_realizadas.append(nueva)
+            continue
+
         com = (
             db.query(models.Comision)
             .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
@@ -81,14 +273,6 @@ def crear_ventas(
             inventario.cantidad -= item.cantidad
 
         fecha_actual = datetime.now(zona_horaria)
-
-        # ✅ VALIDACIÓN CORRECTA
-        if item.tipo_producto == "telefono":
-            if not item.chip_casado:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"chip_casado es obligatorio para teléfonos: {item.producto}"
-                )
 
         total = item.precio_unitario * item.cantidad
 
@@ -129,27 +313,6 @@ def crear_ventas(
                 referencia_id=nueva.id
             )
 
-        # Validar y marcar equipo Telcel como vendido (solo si el teléfono trae imei)
-        if item.tipo_producto == "telefono" and item.imei:
-            imei_limpio = str(item.imei).strip()
-            equipo = (
-                db.query(models.EquiposTelcel)
-                .filter(models.EquiposTelcel.imei == imei_limpio)
-                .first()
-            )
-            if not equipo:
-                raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no está registrado")
-            if equipo.estatus == "vendido":
-                raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} ya fue vendido")
-            if equipo.estatus != "surtido":
-                raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no está surtido a un módulo (estatus: {equipo.estatus})")
-            if equipo.modulo_id != modulo_id:
-                raise HTTPException(status_code=400, detail=f"El IMEI {imei_limpio} no pertenece a este módulo")
-            # Marcar como vendido
-            equipo.estatus = "vendido"
-            equipo.fecha_venta = fecha_actual.replace(tzinfo=None)
-            equipo.folio_venta = folio_venta
-
         ventas_realizadas.append(nueva)
 
     db.commit()
@@ -157,78 +320,12 @@ def crear_ventas(
         db.refresh(v)
 
     # --- UPSET/ACTUALIZACIÓN de CorteDia ---
+    # Aquí sigue en una transacción aparte: si falla, la venta ya quedó guardada.
     try:
-        # obtener o crear corte para la fecha y módulo
-        fecha_corte = fecha_actual.date()
-        modulo_id = current_user.modulo.id
-
-        corte = db.query(models.CorteDia).filter(
-            models.CorteDia.fecha == fecha_corte,
-            models.CorteDia.modulo_id == modulo_id
-        ).first()
-
-        if not corte:
-            corte = models.CorteDia(
-                fecha=fecha_corte,
-                modulo_id=modulo_id,
-                total_efectivo=0.0,
-                total_tarjeta=0.0,
-                adicional_recargas=0.0,
-                adicional_transporte=0.0,
-                adicional_otros=0.0,
-                total_sistema=0.0,
-                total_general=0.0,
-                accesorios_efectivo=0.0,
-                accesorios_tarjeta=0.0,
-                accesorios_total=0.0,
-                telefonos_efectivo=0.0,
-                telefonos_tarjeta=0.0,
-                telefonos_total=0.0
-            )
-            db.add(corte)
-            db.flush()  # asegura que corte tenga id si es necesario
-
-        # Sumarizar las ventas realizadas en este request al corte
-        suma_request = 0.0
-        for v in ventas_realizadas:
-            pago = (v.metodo_pago or "").strip().lower()
-            es_efectivo = pago == "efectivo" or pago == "cash"  # ajusta si tienes otros valores
-            total_v = float(v.total or 0)
-
-            if es_efectivo:
-                corte.total_efectivo = (corte.total_efectivo or 0) + total_v
-                if v.tipo_producto == "accesorios":
-                    corte.accesorios_efectivo = (corte.accesorios_efectivo or 0) + total_v
-                else:
-                    corte.telefonos_efectivo = (corte.telefonos_efectivo or 0) + total_v
-            else:
-                # todo lo que no sea "efectivo" lo acumulamos en tarjeta (ajusta según necesites)
-                corte.total_tarjeta = (corte.total_tarjeta or 0) + total_v
-                if v.tipo_producto == "accesorios":
-                    corte.accesorios_tarjeta = (corte.accesorios_tarjeta or 0) + total_v
-                else:
-                    corte.telefonos_tarjeta = (corte.telefonos_tarjeta or 0) + total_v
-
-            # totales por tipo
-            if v.tipo_producto == "accesorios":
-                corte.accesorios_total = (corte.accesorios_total or 0) + total_v
-            else:
-                corte.telefonos_total = (corte.telefonos_total or 0) + total_v
-
-            # acumulador para total sistema y general
-            corte.total_sistema = (corte.total_sistema or 0) + total_v
-            suma_request += total_v
-
-        # Actualizar total_general (si quieres incluir ya las adicionales, agrégalas aquí)
-        corte.total_general = (corte.total_general or 0) + suma_request
-
+        _sumar_a_corte(db, current_user.modulo.id, fecha_actual.date(), ventas_realizadas)
         db.commit()
-        # opcional: db.refresh(corte)
     except Exception as e:
-        # No queremos romper la respuesta si falla la actualización del corte,
-        # pero sí devolvemos información del error en logs.
         db.rollback()
-        # loguear e.g. logger.error(...) si tienes logger
         print("Error actualizando CorteDia:", e)
 
     return [
@@ -239,7 +336,7 @@ def crear_ventas(
             producto=v.producto,
             cantidad=v.cantidad,
             precio_unitario=v.precio_unitario,
-            metodo_pago=v.metodo_pago, 
+            metodo_pago=v.metodo_pago,
             chip_casado=v.chip_casado,
             total=v.precio_unitario * v.cantidad,
             comision=(v.comision_monto if v.comision_monto is not None
@@ -805,10 +902,41 @@ def crear_ventas_multiples(
 
     # Promociones: solo si algun producto trae promocion. El backend recalcula
     # precios desde inventario general y puede partir renglones por precio.
+    if venta.pago_dividido is not None and any(p.promocion for p in venta.productos):
+        raise HTTPException(status_code=400, detail="Las promociones no aplican con pago dividido.")
     if any(p.promocion for p in venta.productos):
         renglones = preparar_renglones_promocion(db, venta, current_user)
     else:
         renglones = [(p, None, None) for p in venta.productos]
+
+    # Pago dividido: cada renglon se parte en una fila en efectivo (lleva
+    # comision, inventario, kardex e IMEI) y otra en tarjeta (sin nada de eso).
+    partes = None
+    if venta.pago_dividido is not None:
+        ef = round(float(venta.pago_dividido.efectivo), 2)
+        ta = round(float(venta.pago_dividido.tarjeta), 2)
+        if ef <= 0 or ta <= 0:
+            raise HTTPException(status_code=400, detail="Pago dividido: ambos montos deben ser mayores a $0.")
+        total_venta = round(sum(p.precio_unitario * p.cantidad for p, _, _ in renglones), 2)
+        if abs(ef + ta - total_venta) > 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Pago dividido: la suma (${ef + ta:.2f}) no coincide con el total (${total_venta:.2f}).",
+            )
+        pct_ef = ef / total_venta
+        partes = []
+        for p, _, _ in renglones:
+            u_ef = round(p.precio_unitario * pct_ef, 2)
+            partes.append([u_ef, round(p.precio_unitario - u_ef, 2)])
+        # Ajuste de centavos para que el efectivo sume exactamente `ef`; se aplica
+        # a un renglon de cantidad 1 (en renglones con cantidad >1 no cuadraria).
+        dif = round(ef - sum(pt[0] * p.cantidad for pt, (p, _, _) in zip(partes, renglones)), 2)
+        if dif != 0:
+            for pt, (p, _, _) in zip(partes, renglones):
+                if p.cantidad == 1 and pt[0] + dif >= 0 and pt[1] - dif >= 0:
+                    pt[0] = round(pt[0] + dif, 2)
+                    pt[1] = round(pt[1] - dif, 2)
+                    break
 
     # Si el request trae un folio (ej. segunda llamada de pago dividido), reusarlo.
     # Si no, generar uno nuevo (excepto Cadenas id=7).
@@ -820,166 +948,127 @@ def crear_ventas_multiples(
     else:
         folio_venta = None
 
-    for item, precio_original, codigo_promo in renglones:
-        com = (
-            db.query(models.Comision)
-            .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
-            .filter(models.Comision.activo == True)
-            .first()
-        )
-        sin_comision   = item.skip_comision or (item.tipo_producto != 'telefono' and item.precio_unitario < 30)
-        comision_id    = None if sin_comision else (com.id if com else None)
-        comision_monto = None if sin_comision else (com.cantidad if com else None)
-        modulo_id = current_user.modulo.id
-        verificar_modulo_no_congelado(db, modulo_id)
+    modulo_id = current_user.modulo.id
 
-        # skip_inventario (2a peticion del pago dividido): la pieza ya se desconto
-        # en la parte de efectivo; no restar inventario ni escribir kardex otra vez.
-        if not item.skip_inventario:
-            inventario = (
-                db.query(models.InventarioModulo)
-                .filter(
-                    models.InventarioModulo.modulo_id == modulo_id,
-                    models.InventarioModulo.producto == item.producto
-                )
+    for idx, (item, precio_original, codigo_promo) in enumerate(renglones):
+        if partes is None:
+            filas = [(venta.metodo_pago, item.precio_unitario, False)]
+        else:
+            u_ef, u_ta = partes[idx]
+            filas = [("efectivo", u_ef, False)]
+            if u_ta > 0:
+                filas.append(("tarjeta", u_ta, True))
+
+        for metodo, precio, parte_tarjeta in filas:
+            if item.tipo_producto == "telefono":
+                try:
+                    nueva = _registrar_renglon_telefono(
+                        db, item,
+                        usuario=current_user,
+                        modulo_id=modulo_id,
+                        metodo_pago=metodo,
+                        folio=folio_venta,
+                        telefono_cliente=venta.telefono_cliente,
+                        fecha_actual=fecha_actual,
+                        precio_unitario=precio,
+                        parte_tarjeta=parte_tarjeta,
+                        solo_comision_activa=True,
+                    )
+                except HTTPException as e:
+                    raise HTTPException(
+                        status_code=e.status_code,
+                        detail=f"Renglón {idx + 1} ({item.producto}): {e.detail}",
+                    )
+                ventas_realizadas.append(nueva)
+                continue
+
+            skip_comision = parte_tarjeta or item.skip_comision
+            skip_inventario = parte_tarjeta or item.skip_inventario
+
+            com = (
+                db.query(models.Comision)
+                .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
+                .filter(models.Comision.activo == True)
                 .first()
             )
+            # El umbral de $30 se mide con el precio del renglon completo, no con la parte en efectivo.
+            sin_comision   = skip_comision or (item.tipo_producto != 'telefono' and item.precio_unitario < 30)
+            comision_id    = None if sin_comision else (com.id if com else None)
+            comision_monto = None if sin_comision else (com.cantidad if com else None)
+            verificar_modulo_no_congelado(db, modulo_id)
 
-            if not inventario:
-                raise HTTPException(status_code=400, detail=f"No hay inventario para el producto: {item.producto}")
+            # skip_inventario (parte en tarjeta del pago dividido): la pieza ya se
+            # desconto en la parte de efectivo; no restar inventario ni escribir kardex.
+            if not skip_inventario:
+                inventario = (
+                    db.query(models.InventarioModulo)
+                    .filter(
+                        models.InventarioModulo.modulo_id == modulo_id,
+                        models.InventarioModulo.producto == item.producto
+                    )
+                    .first()
+                )
 
-            if inventario.cantidad < item.cantidad:
-                raise HTTPException(status_code=400, detail=f"Inventario insuficiente para el producto: {item.producto}")
+                if not inventario:
+                    raise HTTPException(status_code=400, detail=f"No hay inventario para el producto: {item.producto}")
 
-            # disminuir inventario
-            inventario.cantidad -= item.cantidad
+                if inventario.cantidad < item.cantidad:
+                    raise HTTPException(status_code=400, detail=f"Inventario insuficiente para el producto: {item.producto}")
 
-        # detectar tipo de producto buscando la palabra TELEFONO en cualquier parte
-        tipo_producto = (
-            "telefono"
-            if "TELEFONO" in item.producto.strip().upper()
-            else "accesorios"
-        )
+                inventario.cantidad -= item.cantidad
 
-        nueva = models.Venta(
-            empleado_id=current_user.id,
-            modulo_id=modulo_id,
-            producto=item.producto,
-            cantidad=item.cantidad,
-            precio_unitario=item.precio_unitario,
-            total=item.cantidad * item.precio_unitario,
-            metodo_pago=venta.metodo_pago,
-            comision_id=comision_id,
-            comision_monto=comision_monto,
-            tipo_producto=tipo_producto,
-            fecha=fecha_actual.date(),
-            hora=fecha_actual.time(),
-            telefono_cliente=venta.telefono_cliente,
-            folio=folio_venta,
-            imei=item.imei,
-            clasificacion=item.clasificacion,
-            promocion=codigo_promo,
-            precio_original=precio_original,
-        )
-
-        db.add(nueva)
-        db.flush()
-
-        if not item.skip_inventario:
-            registrar_kardex(
-                db=db,
-                producto=nueva.producto,
-                tipo_producto=nueva.tipo_producto,
-                cantidad=nueva.cantidad,
-                tipo_movimiento="VENTA",
-                usuario_id=current_user.id,
-                modulo_origen_id=modulo_id,
-                referencia_id=nueva.id
+            # detectar tipo de producto buscando la palabra TELEFONO en cualquier parte
+            tipo_producto = (
+                "telefono"
+                if "TELEFONO" in item.producto.strip().upper()
+                else "accesorios"
             )
 
-        ventas_realizadas.append(nueva)
+            nueva = models.Venta(
+                empleado_id=current_user.id,
+                modulo_id=modulo_id,
+                producto=item.producto,
+                cantidad=item.cantidad,
+                precio_unitario=precio,
+                total=item.cantidad * precio,
+                metodo_pago=metodo,
+                comision_id=comision_id,
+                comision_monto=comision_monto,
+                tipo_producto=tipo_producto,
+                fecha=fecha_actual.date(),
+                hora=fecha_actual.time(),
+                telefono_cliente=venta.telefono_cliente,
+                folio=folio_venta,
+                imei=item.imei,
+                clasificacion=item.clasificacion,
+                promocion=codigo_promo,
+                precio_original=precio_original,
+            )
 
-    # confirmar transacción de ventas e inventario
+            db.add(nueva)
+            db.flush()
+
+            if not skip_inventario:
+                registrar_kardex(
+                    db=db,
+                    producto=nueva.producto,
+                    tipo_producto=nueva.tipo_producto,
+                    cantidad=nueva.cantidad,
+                    tipo_movimiento="VENTA",
+                    usuario_id=current_user.id,
+                    modulo_origen_id=modulo_id,
+                    referencia_id=nueva.id
+                )
+
+            ventas_realizadas.append(nueva)
+
+    # Corte dentro de la misma transaccion: un solo commit para ventas,
+    # inventario, kardex, equipos y corte. Si algo falla no se guarda nada.
+    _sumar_a_corte(db, modulo_id, fecha_actual.date(), ventas_realizadas)
     db.commit()
 
-    # refrescar objetos creados para tener los id y relaciones
     for v in ventas_realizadas:
         db.refresh(v)
-
-    # --- UPSET/ACTUALIZACIÓN de CorteDia ---
-    try:
-        # obtener o crear corte para la fecha y módulo
-        fecha_corte = fecha_actual.date()
-        modulo_id = current_user.modulo.id
-
-        corte = db.query(models.CorteDia).filter(
-            models.CorteDia.fecha == fecha_corte,
-            models.CorteDia.modulo_id == modulo_id
-        ).first()
-
-        if not corte:
-            corte = models.CorteDia(
-                fecha=fecha_corte,
-                modulo_id=modulo_id,
-                total_efectivo=0.0,
-                total_tarjeta=0.0,
-                adicional_recargas=0.0,
-                adicional_transporte=0.0,
-                adicional_otros=0.0,
-                total_sistema=0.0,
-                total_general=0.0,
-                accesorios_efectivo=0.0,
-                accesorios_tarjeta=0.0,
-                accesorios_total=0.0,
-                telefonos_efectivo=0.0,
-                telefonos_tarjeta=0.0,
-                telefonos_total=0.0
-            )
-            db.add(corte)
-            db.flush()  # asegura que corte tenga id si es necesario
-
-        # Sumarizar las ventas realizadas en este request al corte
-        suma_request = 0.0
-        for v in ventas_realizadas:
-            pago = (v.metodo_pago or "").strip().lower()
-            es_efectivo = pago == "efectivo" or pago == "cash"  # ajusta si tienes otros valores
-            total_v = float(v.total or 0)
-
-            if es_efectivo:
-                corte.total_efectivo = (corte.total_efectivo or 0) + total_v
-                if v.tipo_producto == "accesorios":
-                    corte.accesorios_efectivo = (corte.accesorios_efectivo or 0) + total_v
-                else:
-                    corte.telefonos_efectivo = (corte.telefonos_efectivo or 0) + total_v
-            else:
-                # todo lo que no sea "efectivo" lo acumulamos en tarjeta (ajusta según necesites)
-                corte.total_tarjeta = (corte.total_tarjeta or 0) + total_v
-                if v.tipo_producto == "accesorios":
-                    corte.accesorios_tarjeta = (corte.accesorios_tarjeta or 0) + total_v
-                else:
-                    corte.telefonos_tarjeta = (corte.telefonos_tarjeta or 0) + total_v
-
-            # totales por tipo
-            if v.tipo_producto == "accesorios":
-                corte.accesorios_total = (corte.accesorios_total or 0) + total_v
-            else:
-                corte.telefonos_total = (corte.telefonos_total or 0) + total_v
-
-            # acumulador para total sistema y general
-            corte.total_sistema = (corte.total_sistema or 0) + total_v
-            suma_request += total_v
-
-        # Actualizar total_general (si quieres incluir ya las adicionales, agrégalas aquí)
-        corte.total_general = (corte.total_general or 0) + suma_request
-
-        db.commit()
-        # opcional: db.refresh(corte)
-    except Exception as e:
-        # No queremos romper la respuesta si falla la actualización del corte,
-        # pero sí devolvemos información del error en logs.
-        db.rollback()
-        # loguear e.g. logger.error(...) si tienes logger
-        print("Error actualizando CorteDia:", e)
 
     # Generar ticket PDF y enviar por WhatsApp
     try:
