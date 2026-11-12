@@ -1559,15 +1559,16 @@ def validar_chip(
     else:
         # Comisiones usando rangos (min, max)
         comisiones_por_chip = {
+            # Desde 2026-11-12: $15 fijo, sin importar la recarga (antes 15/20/30
+            # y "fuera de rango" arriba de $1000).
             "Chip Equipo": [
-                ((0,50), 15),
-                ((51, 100), 20),
-                ((101, 1000), 30)
+                ((0, float("inf")), 15),
             ],
+            # Desde 2026-11-12: $101-150 paga $10 (antes $30).
             "Chip Express": [
                 ((0, 50), 5),
                 ((51, 100), 10),
-                ((101, 150),30)
+                ((101, 150), 10)
             ],
             "Portabilidad": [
                 ((0, 500), 50),
