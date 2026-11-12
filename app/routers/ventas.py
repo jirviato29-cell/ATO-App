@@ -152,6 +152,149 @@ def _registrar_renglon_telefono(
     return nueva
 
 
+def _agregar_venta_chip(
+    db: Session,
+    datos: schemas.VentaChipCreate,
+    *,
+    empleado_id: int,
+    modulo_id: Optional[int],
+    fecha_actual: datetime,
+    detalle_duplicado: str,
+) -> models.VentaChip:
+    """Agrega (flush, sin commit) un registro en venta_chips.
+
+    Lo usan POST /venta_chips y la venta de un telefono (chip casado), para que
+    las dos rutas apliquen las mismas reglas. La comision NO se calcula aqui:
+    la asigna el admin al validar (/venta_chips/{id}/validar), salvo Tarjetas
+    PayJoy, que nace validada con $50.
+    """
+    # Bloquear número duplicado (un número = un solo registro, salvo que el anterior esté cancelado)
+    existente = db.query(models.VentaChip).filter(
+        models.VentaChip.numero_telefono == datos.numero_telefono,
+        models.VentaChip.cancelada == False
+    ).first()
+    if existente:
+        raise HTTPException(status_code=400, detail=detalle_duplicado)
+
+    verificar_modulo_no_congelado(db, modulo_id)
+
+    # El asesor captura solo el dia, sin hora: se guarda a las 00:00. Si viene
+    # la fecha, el tramite ya se hizo y la venta nace marcada como realizada.
+    fecha_porta = None
+    realizada = False
+    if datos.fecha_portabilidad:
+        fecha_porta = datetime.combine(datos.fecha_portabilidad, time(0, 0))
+        realizada = True
+
+    nueva_venta = models.VentaChip(
+        empleado_id=empleado_id,
+        tipo_chip=datos.tipo_chip,
+        numero_telefono=datos.numero_telefono,
+        monto_recarga=datos.monto_recarga,
+        cvip=datos.cvip,
+        fecha=fecha_actual.date(),
+        hora=fecha_actual.time(),
+        imei=datos.imei,
+        iccid=datos.iccid,
+        curp=datos.curp,
+        nip=datos.nip,
+        fecha_portabilidad=fecha_porta,
+        portabilidad_realizada=realizada,
+        cambio_chip=datos.cambio_chip,
+        marca=(datos.marca or "").strip() or None,
+        modelo=(datos.modelo or "").strip() or None,
+        precio=datos.precio,
+    )
+
+    # ── Auto-validar Tarjetas PayJoy (comisión fija, sin necesidad de validación admin)
+    if nueva_venta.tipo_chip == "Tarjetas PayJoy":
+        nueva_venta.comision = 50.00
+        nueva_venta.validado = True
+        nueva_venta.comision_pagada = True
+
+    db.add(nueva_venta)
+    # flush: la sesion no hace autoflush, y un segundo telefono con el mismo
+    # numero en la misma venta debe ver este registro al revisar duplicados.
+    db.flush()
+    return nueva_venta
+
+
+# Clasificacion del telefono vendido -> tipo_chip del registro en venta_chips.
+TIPO_CHIP_POR_CLASIFICACION = {
+    "linea_nueva": "Chip Equipo",
+    "chip_promo": "Chip Equipo",
+    "chip_ato": "Chip Express",
+    "boletin_63": "Boletin 63",
+}
+MODULO_CADENAS = 7
+
+
+def _registrar_chip_de_telefono(
+    db: Session,
+    venta_tel: models.Venta,
+    *,
+    modulo_id: int,
+    fecha_actual: datetime,
+) -> Optional[models.VentaChip]:
+    """Crea en venta_chips el chip casado de un renglon de telefono (sin commit).
+
+    Solo para el renglon que lleva la venta real (efectivo / pago completo),
+    nunca para la parte en tarjeta de un pago dividido. No aplica en Cadenas
+    ni si el telefono no trae clasificacion conocida o numero.
+    """
+    if modulo_id == MODULO_CADENAS:
+        return None
+    tipo_chip = TIPO_CHIP_POR_CLASIFICACION.get(venta_tel.clasificacion or "")
+    numero = (venta_tel.chip_casado or "").strip()
+    if not tipo_chip or not numero:
+        return None
+
+    datos = schemas.VentaChipCreate(
+        tipo_chip=tipo_chip,
+        numero_telefono=numero,
+        monto_recarga=0,
+        cvip=False,
+        imei=(venta_tel.imei or "").strip() or None,
+    )
+    return _agregar_venta_chip(
+        db, datos,
+        empleado_id=venta_tel.empleado_id,
+        modulo_id=modulo_id,
+        fecha_actual=fecha_actual,
+        detalle_duplicado=f"El número {numero} ya está registrado como chip",
+    )
+
+
+def _cancelar_chip_de_telefono(db: Session, venta_tel: models.Venta) -> None:
+    """Cancela (sin commit) el chip que se creo al vender este telefono.
+
+    No hay columna que ligue venta_chips con ventas: se identifica por numero,
+    empleado, fecha, tipo_chip e IMEI, que es lo que _registrar_chip_de_telefono
+    copio de la venta.
+    """
+    if venta_tel.tipo_producto != "telefono":
+        return
+    tipo_chip = TIPO_CHIP_POR_CLASIFICACION.get(venta_tel.clasificacion or "")
+    numero = (venta_tel.chip_casado or "").strip()
+    if not tipo_chip or not numero:
+        return
+    imei = (venta_tel.imei or "").strip() or None
+    chips = (
+        db.query(models.VentaChip)
+        .filter(
+            models.VentaChip.numero_telefono == numero,
+            models.VentaChip.empleado_id == venta_tel.empleado_id,
+            models.VentaChip.fecha == venta_tel.fecha,
+            models.VentaChip.tipo_chip == tipo_chip,
+            models.VentaChip.imei == imei if imei else models.VentaChip.imei.is_(None),
+            models.VentaChip.cancelada == False,  # noqa: E712
+        )
+        .all()
+    )
+    for chip in chips:
+        chip.cancelada = True
+
+
 def _sumar_a_corte(db: Session, modulo_id: int, fecha_corte: date, ventas: list) -> None:
     """Suma las ventas al CorteDia del módulo/fecha (lo crea si no existe). Sin commit."""
     corte = db.query(models.CorteDia).filter(
@@ -241,6 +384,14 @@ def crear_ventas(
                 telefono_cliente=venta.telefono_cliente,
                 fecha_actual=fecha_actual,
             )
+            # Pago dividido del diseño actual: la parte en tarjeta llega en una
+            # segunda peticion con skip_inventario. Solo la de efectivo crea el chip.
+            if not item.skip_inventario:
+                _registrar_chip_de_telefono(
+                    db, nueva,
+                    modulo_id=current_user.modulo_id,
+                    fecha_actual=fecha_actual,
+                )
             ventas_realizadas.append(nueva)
             continue
 
@@ -688,6 +839,8 @@ def cancelar_venta(
                     f"imei '{venta.imei}': equipo no encontrado o folio_venta no coincide. "
                     f"IMEI NO revertido, revisar manualmente."
                 )
+        # El chip casado se creo con este renglon (el que desconto inventario).
+        _cancelar_chip_de_telefono(db, venta)
     else:
         print(f"[cancelacion] Venta {venta.id} folio {venta.folio}: sin kardex VENTA, "
               f"no se regresa inventario ni IMEI.")
@@ -806,6 +959,8 @@ def devolver_venta(
                     f"[ALERTA devolucion IMEI] Venta {venta.id} folio {venta.folio} "
                     f"imei '{venta.imei}': no revertido, revisar manualmente."
                 )
+        # El chip casado se creo con este renglon (el que desconto inventario).
+        _cancelar_chip_de_telefono(db, venta)
     else:
         print(f"[devolucion] Venta {venta.id} folio {venta.folio}: sin kardex VENTA, "
               f"no se regresa inventario ni IMEI.")
@@ -1034,6 +1189,14 @@ def crear_ventas_multiples(
                         status_code=e.status_code,
                         detail=f"Renglón {idx + 1} ({item.producto}): {e.detail}",
                     )
+                # Fuera del try: el duplicado sale con su mensaje tal cual.
+                # Pago dividido: solo la fila en efectivo crea el chip.
+                if not parte_tarjeta:
+                    _registrar_chip_de_telefono(
+                        db, nueva,
+                        modulo_id=modulo_id,
+                        fecha_actual=fecha_actual,
+                    )
                 ventas_realizadas.append(nueva)
                 continue
 
@@ -1174,55 +1337,13 @@ def crear_venta_chip(
             detail="Debes seleccionar una opcion (Si o No)"
         )
 
-    # Bloquear número duplicado (un número = un solo registro, salvo que el anterior esté cancelado)
-    existente = db.query(models.VentaChip).filter(
-        models.VentaChip.numero_telefono == venta.numero_telefono,
-        models.VentaChip.cancelada == False
-    ).first()
-    if existente:
-        raise HTTPException(
-            status_code=400,
-            detail=f"El número {venta.numero_telefono} ya tiene un chip registrado"
-        )
-
-    verificar_modulo_no_congelado(db, current_user.modulo_id)
-    fecha_actual = datetime.now(zona_horaria)
-
-    # El asesor captura solo el dia, sin hora: se guarda a las 00:00. Si viene
-    # la fecha, el tramite ya se hizo y la venta nace marcada como realizada.
-    fecha_porta = None
-    realizada = False
-    if venta.fecha_portabilidad:
-        fecha_porta = datetime.combine(venta.fecha_portabilidad, time(0, 0))
-        realizada = True
-
-    nueva_venta = models.VentaChip(
+    nueva_venta = _agregar_venta_chip(
+        db, venta,
         empleado_id=current_user.id,
-        tipo_chip=venta.tipo_chip,
-        numero_telefono=venta.numero_telefono,
-        monto_recarga=venta.monto_recarga,
-        cvip=venta.cvip,
-        fecha=fecha_actual.date(),
-        hora=fecha_actual.time(),
-        imei=venta.imei,
-        iccid=venta.iccid,
-        curp=venta.curp,
-        nip=venta.nip,
-        fecha_portabilidad=fecha_porta,
-        portabilidad_realizada=realizada,
-        cambio_chip=venta.cambio_chip,
-        marca=(venta.marca or "").strip() or None,
-        modelo=(venta.modelo or "").strip() or None,
-        precio=venta.precio,
+        modulo_id=current_user.modulo_id,
+        fecha_actual=datetime.now(zona_horaria),
+        detalle_duplicado=f"El número {venta.numero_telefono} ya tiene un chip registrado",
     )
-
-    # ── Auto-validar Tarjetas PayJoy (comisión fija, sin necesidad de validación admin)
-    if nueva_venta.tipo_chip == "Tarjetas PayJoy":
-        nueva_venta.comision = 50.00
-        nueva_venta.validado = True
-        nueva_venta.comision_pagada = True
-
-    db.add(nueva_venta)
     db.commit()
     db.refresh(nueva_venta)
     return nueva_venta
