@@ -235,6 +235,7 @@ def _registrar_chip_de_telefono(
     *,
     modulo_id: int,
     fecha_actual: datetime,
+    monto_recarga: Optional[float] = None,
 ) -> Optional[models.VentaChip]:
     """Crea en venta_chips el chip casado de un renglon de telefono (sin commit).
 
@@ -248,11 +249,14 @@ def _registrar_chip_de_telefono(
     numero = (venta_tel.chip_casado or "").strip()
     if not tipo_chip or not numero:
         return None
+    recarga = float(monto_recarga or 0)
+    if recarga < 0:
+        raise HTTPException(status_code=400, detail="La recarga no puede ser negativa")
 
     datos = schemas.VentaChipCreate(
         tipo_chip=tipo_chip,
         numero_telefono=numero,
-        monto_recarga=0,
+        monto_recarga=recarga,
         cvip=False,
         imei=(venta_tel.imei or "").strip() or None,
     )
@@ -391,6 +395,7 @@ def crear_ventas(
                     db, nueva,
                     modulo_id=current_user.modulo_id,
                     fecha_actual=fecha_actual,
+                    monto_recarga=item.monto_recarga,
                 )
             ventas_realizadas.append(nueva)
             continue
@@ -1196,6 +1201,7 @@ def crear_ventas_multiples(
                         db, nueva,
                         modulo_id=modulo_id,
                         fecha_actual=fecha_actual,
+                        monto_recarga=item.monto_recarga,
                     )
                 ventas_realizadas.append(nueva)
                 continue

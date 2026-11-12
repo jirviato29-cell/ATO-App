@@ -308,6 +308,8 @@ class ProductoEnVenta(BaseModel):
     clasificacion: Optional[str] = None
     clave: Optional[str] = None
     promocion: Optional[str] = None
+    # Solo telefonos: recarga del chip casado (va a venta_chips.monto_recarga).
+    monto_recarga: Optional[float] = None
 
 class PagoDividido(BaseModel):
     efectivo: float
