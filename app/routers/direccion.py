@@ -1712,6 +1712,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     from io import BytesIO
     from fastapi.responses import StreamingResponse
     from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.lib.colors import HexColor, white, black
 
     EXCLUIR_IDS  = {21, 7}
@@ -1841,6 +1842,44 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         elif m in TARJETA_SET:
             pago_tot_tar += monto
 
+    # Desglose de teléfonos vendidos HOY por tipo_venta (Contado, Paguitos,
+    # PayJoy, Planes). tipo_venta IS NOT NULL evita doble conteo del pago
+    # dividido (la parte tarjeta se guarda con tipo_venta None). Usa EXCLUIR_IDS
+    # para quedar alineado con el "N equipos" del Resumen general.
+    tel_hoy_rows = (
+        db.query(
+            func.lower(models.Venta.tipo_venta),
+            func.coalesce(func.sum(models.Venta.cantidad), 0),
+        )
+        .filter(
+            models.Venta.fecha == fecha,
+            func.lower(models.Venta.tipo_producto) == "telefono",
+            models.Venta.tipo_venta.isnot(None),
+            models.Venta.cancelada.isnot(True),
+            ~models.Venta.modulo_id.in_(EXCLUIR_IDS),
+        )
+        .group_by(func.lower(models.Venta.tipo_venta))
+        .all()
+    )
+    tel_hoy_por_tv = {tv: int(c or 0) for tv, c in tel_hoy_rows}
+    dia_tel_contado  = tel_hoy_por_tv.get("contado", 0)
+    dia_tel_paguitos = tel_hoy_por_tv.get("paguitos", 0)
+    dia_tel_payjoy   = tel_hoy_por_tv.get("payjoy", 0)
+    dia_tel_planes   = tel_hoy_por_tv.get("plan", 0)
+
+    # Piezas de accesorios vendidas HOY (incluye las regaladas por promoción).
+    dia_acc_piezas = int(
+        db.query(func.coalesce(func.sum(models.Venta.cantidad), 0))
+        .filter(
+            models.Venta.fecha == fecha,
+            func.lower(models.Venta.tipo_producto) == "accesorios",
+            models.Venta.cancelada.isnot(True),
+            ~models.Venta.modulo_id.in_(EXCLUIR_IDS),
+        )
+        .scalar()
+        or 0
+    )
+
     # 2) COMPARATIVO VS AÑO PASADO (fecha - 364 días, mismo día de la semana) ─
     fecha_ant = fecha - timedelta(days=364)
 
@@ -1939,7 +1978,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     HDR_H   = 20
     BANDA_H = 26
     SUB_H   = 22
-    BOX_H   = 85.0
+    BOX_H   = 100.0
     BAR_H   = 30
     BOX_W   = (ancho - 10) / 2
 
@@ -1960,12 +1999,12 @@ def _generar_pdf_reporte(fecha: date, db: Session):
                 content_h += HDR_H + acc_vis * ROW_H
             content_h += SUB_H + 26
 
-    # Alturas de las 3 secciones compactas que se dibujan arriba, entre TOTAL
-    # GENERAL DEL DÍA y VENTAS POR MÓDULO.
-    PAGO_H = BAR_H + 10
+    # Alturas de las 2 secciones compactas que se dibujan arriba, entre TOTAL
+    # GENERAL DEL DÍA y VENTAS POR MÓDULO. (Forma de pago ya va fusionada en
+    # la barra amarilla del TOTAL GENERAL DEL DÍA.)
     COMP_H = HDR_H + (ROW_H * 4) + 10
     CONT_H = HDR_H + (ROW_H * 5) + 10
-    content_h += PAGO_H + COMP_H + CONT_H
+    content_h += COMP_H + CONT_H
 
     H = 82.0 + content_h + MARGEN
 
@@ -2028,36 +2067,45 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         c.setFont("Helvetica-Bold", 13)
         c.drawCentredString(bx + BOX_W / 2, by + BOX_H - 18, lbl)
         c.setFont("Helvetica-Bold", 20)
-        c.drawCentredString(bx + BOX_W / 2, by + 36, fp(val))
+        c.drawCentredString(bx + BOX_W / 2, by + 50, fp(val))
         if lbl == "Teléfonos":
             c.setFillColor(VERDE)
             c.setFont("Helvetica-Bold", 12)
-            c.drawCentredString(bx + BOX_W / 2, by + 12, f"{total_unidades_tel} equipos")
+            c.drawCentredString(bx + BOX_W / 2, by + 28, f"{total_unidades_tel} equipos")
+            c.setFillColor(AZUL)
+            c.setFont("Helvetica-Bold", 10)
+            desglose = (
+                f"Contado {dia_tel_contado}  ·  Paguitos {dia_tel_paguitos}"
+                f"  ·  PayJoy {dia_tel_payjoy}  ·  Planes {dia_tel_planes}"
+            )
+            c.drawCentredString(bx + BOX_W / 2, by + 10, desglose)
+        else:
+            c.setFillColor(VERDE)
+            c.setFont("Helvetica-Bold", 12)
+            c.drawCentredString(bx + BOX_W / 2, by + 28, f"{dia_acc_piezas} piezas")
     y -= BOX_H + 6
 
+    # Barra amarilla: Efectivo · Terminal · Total del día (reemplaza también
+    # la antigua barra separada de "FORMA DE PAGO").
     c.setFillColor(AMARILLO)
     c.rect(MARGEN, y - BAR_H, ancho, BAR_H, fill=1, stroke=0)
     c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(MARGEN + 8, y - 23, "TOTAL GENERAL DEL DÍA")
-    c.drawRightString(CT, y - 23, fp(res_tot))
-    y -= BAR_H + 12
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FORMA DE PAGO — solo totales generales (efectivo vs terminal)
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(AZUL)
-    c.rect(MARGEN, y - BAR_H, ancho, BAR_H, fill=1, stroke=0)
-    c.setFillColor(white)
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(MARGEN + 8, y - 20, "FORMA DE PAGO")
+    c.drawString(MARGEN + 8, y - 20, "TOTAL GENERAL DEL DÍA")
     c.setFont("Helvetica-Bold", 11)
-    col_ef = MARGEN + 300
-    c.drawString(col_ef, y - 20, "Efectivo:")
-    c.drawRightString(col_ef + 110, y - 20, fp(pago_tot_ef))
-    c.drawString(col_ef + 125, y - 20, "Terminal:")
-    c.drawRightString(CT - 4, y - 20, fp(pago_tot_tar))
-    y -= BAR_H + 10
+    col_ef_lbl = MARGEN + 180
+    col_ef_val = MARGEN + 290
+    col_tar_lbl = MARGEN + 305
+    col_tar_val = MARGEN + 410
+    col_tot_lbl = MARGEN + 425
+    c.drawString(col_ef_lbl, y - 20, "Efectivo:")
+    c.drawRightString(col_ef_val, y - 20, fp(pago_tot_ef))
+    c.drawString(col_tar_lbl, y - 20, "Terminal:")
+    c.drawRightString(col_tar_val, y - 20, fp(pago_tot_tar))
+    c.drawString(col_tot_lbl, y - 20, "Total:")
+    c.setFont("Helvetica-Bold", 13)
+    c.drawRightString(CT - 4, y - 20, fp(res_tot))
+    y -= BAR_H + 12
 
     # ─────────────────────────────────────────────────────────────────────────
     # COMPARATIVO CONTRA EL AÑO PASADO (compacto)
@@ -2210,17 +2258,26 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         c.drawString(MARGEN + 8, y - 14, "Sin teléfonos vendidos hoy")
         y -= 22
     else:
+        # Ancho disponible para el nombre completo del teléfono, antes de la
+        # columna del módulo. Si el nombre no cabe con 12pt, bajamos tamaño.
+        ancho_modelo = CM_GBL - CP - 6
         for idx, item in enumerate(tel_global):
             c.setFillColor(GRIS_F if idx % 2 == 0 else white)
             c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
             c.setFillColor(black)
+            # Nombre sin el prefijo "TELEFONO " para que arranque con TELCEL o
+            # LIBRE, sin truncar, en una sola línea.
+            nombre = item["modelo"].strip()
+            if nombre.upper().startswith("TELEFONO "):
+                nombre = nombre[len("TELEFONO "):]
+            if item["cant"] > 1:
+                nombre = f"{nombre} (x{item['cant']})"
+            for font_size in (12, 11, 10, 9, 8, 7):
+                if stringWidth(nombre, "Helvetica", font_size) <= ancho_modelo:
+                    break
+            c.setFont("Helvetica", font_size)
+            c.drawString(CP, y - 11, nombre)
             c.setFont("Helvetica", 12)
-            modelo_txt = (
-                item["modelo"][:24] + f" (x{item['cant']})"
-                if item["cant"] > 1
-                else item["modelo"][:30]
-            )
-            c.drawString(CP, y - 11, modelo_txt)
             c.drawString(CM_GBL, y - 11, item["modulo"][:22])
             c.drawRightString(CT, y - 11, fp(item["total"]))
             y -= ROW_H
