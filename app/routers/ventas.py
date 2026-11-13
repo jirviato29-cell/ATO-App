@@ -14,6 +14,7 @@ from app.routers.kardex import registrar_kardex
 from app.routers.planes_tarifarios import revertir_plan
 from app.routers.promociones import preparar_renglones_promocion
 import os
+import re
 from supabase import create_client
 
 def _get_supabase():
@@ -29,6 +30,93 @@ router = APIRouter()
 
 
 zona_horaria = ZoneInfo("America/Mexico_City")
+
+
+# ── Comision $0 por vender un accesorio abajo del precio de inventario ──────
+# Accesorio = el precio de lista viene en el nombre ("MICA DE HIDROGEL $299"),
+# tablets incluidas; telefonos y modems no. Si el renglon NO lleva promocion
+# valida y su precio_unitario es menor al precio de inventario del modulo, la
+# comision es $0. Aplica solo a ventas nuevas: nada recalcula ventas viejas.
+#
+# Se guarda comision_id=None y comision_monto=0: la nomina (services.py) suma
+# Comision.cantidad por comision_id, asi que con el id puesto se pagaria igual.
+# Esa pareja (None, 0) solo la produce esta regla; el pago dividido viejo la
+# usa para reconocer la fila en efectivo (ver _restaurar_comision_dividido).
+_PRECIO_EN_NOMBRE = re.compile(r"\$\s*\d")
+# Centavos que pierde el pago dividido viejo al prorratear cada parte.
+_TOLERANCIA_DIVIDIDO = 0.02
+
+
+def _es_accesorio_con_precio(producto: Optional[str]) -> bool:
+    nombre = (producto or "").upper()
+    if "TELEFONO" in nombre or "TELÉFONO" in nombre or "MODEM" in nombre or "MÓDEM" in nombre:
+        return False
+    return bool(_PRECIO_EN_NOMBRE.search(nombre))
+
+
+def _vendido_abajo_de_inventario(
+    db: Session, modulo_id: Optional[int], producto: str, precio: float, tolerancia: float = 0.0
+) -> bool:
+    """True si es accesorio con precio en el nombre y precio < precio del
+    inventario del modulo. Sin renglon de inventario o sin precio: False."""
+    if not _es_accesorio_con_precio(producto):
+        return False
+    inv = (
+        db.query(models.InventarioModulo.precio)
+        .filter(
+            models.InventarioModulo.modulo_id == modulo_id,
+            models.InventarioModulo.producto == producto,
+        )
+        .first()
+    )
+    if inv is None or inv.precio is None:
+        return False
+    return float(precio) + tolerancia < float(inv.precio)
+
+
+def _restaurar_comision_dividido(
+    db: Session, venta: schemas.VentaMultipleCreate, current_user: models.Usuario, usadas: set
+) -> None:
+    """Pago dividido del diseno viejo: el frontend manda dos POST a
+    /ventas/multiples, primero la parte en efectivo (precio prorrateado) y luego
+    la de tarjeta con el folio y skip_comision. La parte en efectivo sola parece
+    vendida abajo del inventario y nace con comision $0; aqui, con las dos
+    partes ya conocidas, se le regresa la comision si el renglon completo
+    (efectivo + tarjeta) no quedo abajo del precio de inventario. Sin commit."""
+    if not venta.folio or venta.pago_dividido is not None:
+        return
+    for item in venta.productos:
+        if not item.skip_comision or not _es_accesorio_con_precio(item.producto):
+            continue
+        q = db.query(models.Venta).filter(
+            models.Venta.folio == venta.folio,
+            models.Venta.empleado_id == current_user.id,
+            models.Venta.producto == item.producto,
+            models.Venta.cantidad == item.cantidad,
+            models.Venta.metodo_pago == "efectivo",
+            models.Venta.cancelada == False,  # noqa: E712
+            models.Venta.comision_id.is_(None),
+            models.Venta.comision_monto == 0,
+        )
+        if usadas:
+            q = q.filter(~models.Venta.id.in_(usadas))
+        fila_ef = q.order_by(models.Venta.id).first()
+        if fila_ef is None:
+            continue
+        usadas.add(fila_ef.id)
+        precio_completo = float(fila_ef.precio_unitario or 0) + float(item.precio_unitario or 0)
+        if precio_completo < 30 or _vendido_abajo_de_inventario(
+            db, fila_ef.modulo_id, item.producto, precio_completo, _TOLERANCIA_DIVIDIDO
+        ):
+            continue
+        com = (
+            db.query(models.Comision)
+            .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
+            .filter(models.Comision.activo == True)  # noqa: E712
+            .first()
+        )
+        fila_ef.comision_id = com.id if com else None
+        fila_ef.comision_monto = com.cantidad if com else None
 
 
 def _registrar_renglon_telefono(
@@ -409,6 +497,9 @@ def crear_ventas(
         comision_id    = None if sin_comision else (com.id if com else None)
         comision_monto = None if sin_comision else (com.cantidad if com else None)
         modulo_id = current_user.modulo_id
+        # Este endpoint no maneja promociones: abajo del inventario, comision $0.
+        if not sin_comision and _vendido_abajo_de_inventario(db, modulo_id, item.producto, item.precio_unitario):
+            comision_id, comision_monto = None, 0
         verificar_modulo_no_congelado(db, modulo_id)
 
         if not item.skip_inventario:
@@ -1219,6 +1310,15 @@ def crear_ventas_multiples(
             sin_comision   = skip_comision or (item.tipo_producto != 'telefono' and item.precio_unitario < 30)
             comision_id    = None if sin_comision else (com.id if com else None)
             comision_monto = None if sin_comision else (com.cantidad if com else None)
+            # Sin promocion valida y abajo del precio de inventario: comision $0.
+            # Igual que el umbral de $30, se mide con el precio del renglon
+            # completo (item.precio_unitario), no con la parte en efectivo.
+            if (
+                not sin_comision
+                and codigo_promo is None
+                and _vendido_abajo_de_inventario(db, modulo_id, item.producto, item.precio_unitario)
+            ):
+                comision_id, comision_monto = None, 0
             verificar_modulo_no_congelado(db, modulo_id)
 
             # skip_inventario (parte en tarjeta del pago dividido): la pieza ya se
@@ -1285,6 +1385,11 @@ def crear_ventas_multiples(
                 )
 
             ventas_realizadas.append(nueva)
+
+    # Pago dividido viejo (segunda peticion, la de tarjeta): regresa la
+    # comision a la fila en efectivo si el renglon completo no quedo abajo
+    # del inventario. Va en la misma transaccion que esta parte.
+    _restaurar_comision_dividido(db, venta, current_user, set())
 
     # Corte dentro de la misma transaccion: un solo commit para ventas,
     # inventario, kardex, equipos y corte. Si algo falla no se guarda nada.
