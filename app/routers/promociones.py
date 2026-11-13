@@ -16,6 +16,12 @@ router = APIRouter()
 ZONA = ZoneInfo("America/Mexico_City")
 MODULO_CADENAS = 7
 LIMITE_PIEZA_CARA = 1000  # piezas de mas de $1,000 tienen tope y nunca llevan descuento
+# MICA_GRATIS: 1 mica de hidrogel en $0 por cada telefono participante
+# (clave en promociones.claves) vendido de Contado, con pago en efectivo.
+MICA_GRATIS = "MICA_GRATIS"
+CLAVE_MICA_GRATIS = "MICHIDRO199"
+# Promos que se calculan aparte y conviven con 3X2/2DA30 en el mismo ticket.
+PROMOS_APARTE = {"FUNDAS30", MICA_GRATIS}
 
 
 def hoy_mx() -> date:
@@ -85,6 +91,14 @@ def calcular_precios_promo(codigo: str, renglones: List[dict], claves_promo: Opt
             salida.append((r["idx"], r["cantidad"], round(r["precio_original"] * 0.70, 2)))
         return salida
 
+    if codigo == MICA_GRATIS:
+        # Las reglas (telefono participante, contado, efectivo, tope) se validan
+        # en preparar_renglones_promocion; aqui solo el precio.
+        for r in renglones:
+            if r["clave"] != CLAVE_MICA_GRATIS:
+                raise ValueError(f"La clave {r['clave']} no participa en la promoción MICA_GRATIS.")
+        return [(r["idx"], r["cantidad"], 0.0) for r in renglones]
+
     if codigo == "3X2":
         grupo, factor = 3, 0.0
     elif codigo == "2DA30":
@@ -144,7 +158,7 @@ def preparar_renglones_promocion(
     # FUNDAS30 se calcula aparte (30% sobre sus propias piezas) y puede convivir
     # con 3X2 o 2DA30 en el mismo ticket. Lo que sigue prohibido es mezclar 3X2
     # con 2DA30 en la misma venta.
-    codigos_grupo = {c for c in codigos if c != "FUNDAS30"}
+    codigos_grupo = {c for c in codigos if c not in PROMOS_APARTE}
     if len(codigos_grupo) > 1:
         rechazar("No se pueden combinar dos promociones distintas en la misma venta.")
 
@@ -156,6 +170,27 @@ def preparar_renglones_promocion(
         if not aplica_en_modulo(promo, _modulo_id(current_user)):
             rechazar("La promoción no aplica en este módulo.")
         promos_por_codigo[cod] = promo
+
+    if MICA_GRATIS in codigos:
+        if (venta.metodo_pago or "").strip().lower() != "efectivo":
+            rechazar("La mica de hidrogel gratis solo aplica con pago en efectivo.")
+        claves_tel = {(c or "").strip().upper() for c in (promos_por_codigo[MICA_GRATIS].claves or [])}
+        participantes = sum(
+            p.cantidad or 0
+            for p in venta.productos
+            if (p.tipo_producto or "").strip().lower() == "telefono"
+            and (p.clave or "").strip().upper() in claves_tel
+            and (p.tipo_venta or "").strip().lower() == "contado"
+        )
+        micas = sum(
+            p.cantidad or 0
+            for p in venta.productos
+            if (p.promocion or "").strip().upper() == MICA_GRATIS
+        )
+        if participantes == 0:
+            rechazar("La mica de hidrogel gratis requiere un teléfono participante vendido de Contado en la misma venta.")
+        if micas > participantes:
+            rechazar(f"Solo se permite 1 mica de hidrogel gratis por teléfono participante (llevas {micas} para {participantes}).")
 
     renglones_por_codigo: dict = {}
     originales: dict = {}
