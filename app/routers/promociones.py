@@ -141,18 +141,26 @@ def preparar_renglones_promocion(
     # Carrito mixto permitido: los productos sin promocion pasan a precio normal.
     con_promo = [(idx, p) for idx, p in enumerate(venta.productos) if (p.promocion or "").strip()]
     codigos = {p.promocion.strip().upper() for _, p in con_promo}
-    if len(codigos) != 1:
+    # FUNDAS30 se calcula aparte (30% sobre sus propias piezas) y puede convivir
+    # con 3X2 o 2DA30 en el mismo ticket. Lo que sigue prohibido es mezclar 3X2
+    # con 2DA30 en la misma venta.
+    codigos_grupo = {c for c in codigos if c != "FUNDAS30"}
+    if len(codigos_grupo) > 1:
         rechazar("No se pueden combinar dos promociones distintas en la misma venta.")
-    codigo = codigos.pop()
 
-    promo = promo_vigente(db, codigo)
-    if not promo:
-        rechazar(f"La promoción {codigo} no existe o no está activa hoy.")
-    if not aplica_en_modulo(promo, _modulo_id(current_user)):
-        rechazar("La promoción no aplica en este módulo.")
+    promos_por_codigo: dict = {}
+    for cod in codigos:
+        promo = promo_vigente(db, cod)
+        if not promo:
+            rechazar(f"La promoción {cod} no existe o no está activa hoy.")
+        if not aplica_en_modulo(promo, _modulo_id(current_user)):
+            rechazar("La promoción no aplica en este módulo.")
+        promos_por_codigo[cod] = promo
 
-    renglones = []
+    renglones_por_codigo: dict = {}
+    originales: dict = {}
     for idx, item in con_promo:
+        cod = item.promocion.strip().upper()
         if (item.tipo_producto or "").strip().lower() == "telefono" or "TELEFONO" in item.producto.strip().upper():
             rechazar(f"La promoción solo aplica a accesorios ({item.producto} no lo es).")
         if item.cantidad is None or item.cantidad <= 0:
@@ -167,21 +175,25 @@ def preparar_renglones_promocion(
         )
         if not inv or inv.precio is None:
             rechazar(f"No se encontró el precio de la clave {clave} en el inventario general.")
-        renglones.append({"idx": idx, "cantidad": item.cantidad, "precio_original": float(inv.precio), "clave": clave})
+        precio_original = float(inv.precio)
+        renglones_por_codigo.setdefault(cod, []).append(
+            {"idx": idx, "cantidad": item.cantidad, "precio_original": precio_original, "clave": clave}
+        )
+        originales[idx] = precio_original
 
-    try:
-        calculados = calcular_precios_promo(codigo, renglones, promo.claves)
-    except ValueError as e:
-        rechazar(str(e))
-
-    originales = {r["idx"]: r["precio_original"] for r in renglones}
     por_idx: dict = {}
-    for idx, cantidad, precio in calculados:
-        por_idx.setdefault(idx, []).append((
-            venta.productos[idx].model_copy(update={"cantidad": cantidad, "precio_unitario": precio}),
-            originales[idx],
-            promo.codigo,
-        ))
+    for cod, renglones in renglones_por_codigo.items():
+        promo = promos_por_codigo[cod]
+        try:
+            calculados = calcular_precios_promo(cod, renglones, promo.claves)
+        except ValueError as e:
+            rechazar(str(e))
+        for idx, cantidad, precio in calculados:
+            por_idx.setdefault(idx, []).append((
+                venta.productos[idx].model_copy(update={"cantidad": cantidad, "precio_unitario": precio}),
+                originales[idx],
+                promo.codigo,
+            ))
 
     # Respeta el orden del carrito; los productos sin promocion van tal cual.
     salida = []
