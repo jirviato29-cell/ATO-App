@@ -243,6 +243,10 @@ def _comision_unitaria(v) -> float:
         tipo = v.tipo_venta or ""
         if tipo == "Contado" and base > 0:
             return base
+        # Vendido abajo del precio (comision_id=None y comision_monto=0): $0,
+        # igual que services._abajo_del_precio. Con monto NULL, los $10 de siempre.
+        if v.comision_monto is not None and v.comision_monto == 0 and v.comision_id is None:
+            return 0.0
         return base + _EXTRA_POR_TIPO.get(tipo, 0)
     return base
 
