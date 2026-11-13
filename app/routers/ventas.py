@@ -74,6 +74,85 @@ def _vendido_abajo_de_inventario(
     return float(precio) + tolerancia < float(inv.precio)
 
 
+# ── Lo mismo para telefonos, solo de Contado ────────────────────────────────
+# Se compara contra inventario_general, NO inventario_modulo: en el de modulo
+# los precios del Buen Fin no estan actualizados. Paguitos y PayJoy no entran
+# (su precio es el pago inicial y varia) y los modems quedan como estaban.
+def _precio_general_telefono(db: Session, producto: str, clave: Optional[str]) -> Optional[float]:
+    q = db.query(models.InventarioGeneral.precio)
+    clave = (clave or "").strip().upper()
+    if clave:
+        fila = q.filter(func.upper(func.trim(models.InventarioGeneral.clave)) == clave).first()
+    else:
+        # El diseno viejo no manda clave: "MARCA MODELO", igual que inventario_modulo.
+        fila = q.filter(
+            func.upper(func.trim(models.InventarioGeneral.producto)) == (producto or "").strip().upper()
+        ).first()
+    return float(fila.precio) if fila is not None and fila.precio is not None else None
+
+
+def _telefono_contado_abajo_de_general(
+    db: Session, producto: str, clave: Optional[str], tipo_venta: Optional[str],
+    precio: float, tolerancia: float = 0.0,
+) -> bool:
+    """True si es telefono de Contado (no modem) y precio < precio de
+    inventario_general. Sin renglon o sin precio en el general: False."""
+    if (tipo_venta or "").strip().lower() != "contado":
+        return False
+    nombre = (producto or "").upper()
+    if "MODEM" in nombre or "MÓDEM" in nombre:
+        return False
+    precio_general = _precio_general_telefono(db, producto, clave)
+    if precio_general is None:
+        return False
+    return float(precio) + tolerancia < precio_general
+
+
+def _restaurar_comision_telefono_dividido(
+    db: Session, venta: schemas.VentaMultipleCreate, current_user: models.Usuario, solo_comision_activa: bool
+) -> None:
+    """Pago dividido viejo de telefono: dos POST a /ventas, primero la parte en
+    efectivo (precio = solo esa parte, nace con comision $0 si es Contado) y
+    luego la de tarjeta con el folio y skip_comision. Con las dos partes ya
+    conocidas, le regresa la comision a la fila en efectivo si efectivo +
+    tarjeta no quedo abajo del inventario general. Sin commit."""
+    if not venta.folio or venta.pago_dividido is not None:
+        return
+    usadas: set = set()
+    for item in venta.productos:
+        if item.tipo_producto != "telefono" or not item.skip_comision:
+            continue
+        q = db.query(models.Venta).filter(
+            models.Venta.folio == venta.folio,
+            models.Venta.empleado_id == current_user.id,
+            models.Venta.producto == item.producto,
+            models.Venta.tipo_producto == "telefono",
+            models.Venta.metodo_pago == "efectivo",
+            models.Venta.cancelada == False,  # noqa: E712
+            models.Venta.comision_id.is_(None),
+            models.Venta.comision_monto == 0,
+        )
+        if usadas:
+            q = q.filter(~models.Venta.id.in_(usadas))
+        fila_ef = q.order_by(models.Venta.id).first()
+        if fila_ef is None:
+            continue
+        usadas.add(fila_ef.id)
+        precio_completo = float(fila_ef.precio_unitario or 0) + float(item.precio_unitario or 0)
+        if _telefono_contado_abajo_de_general(
+            db, item.producto, item.clave, fila_ef.tipo_venta, precio_completo, _TOLERANCIA_DIVIDIDO
+        ):
+            continue
+        q_com = db.query(models.Comision).filter(
+            func.lower(models.Comision.producto) == item.producto.strip().lower()
+        )
+        if solo_comision_activa:
+            q_com = q_com.filter(models.Comision.activo == True)  # noqa: E712
+        com = q_com.first()
+        fila_ef.comision_id = com.id if com else None
+        fila_ef.comision_monto = com.cantidad if com else None
+
+
 def _restaurar_comision_dividido(
     db: Session, venta: schemas.VentaMultipleCreate, current_user: models.Usuario, usadas: set
 ) -> None:
@@ -157,6 +236,13 @@ def _registrar_renglon_telefono(
     com = q_com.first()
     comision_id = None if skip_comision else (com.id if com else None)
     comision_monto = None if skip_comision else (com.cantidad if com else None)
+    # Contado abajo del precio de inventario_general: comision $0. Se mide con
+    # el precio del renglon completo (item.precio_unitario), no con la parte
+    # en efectivo del pago dividido nuevo.
+    if not skip_comision and _telefono_contado_abajo_de_general(
+        db, item.producto, item.clave, item.tipo_venta, item.precio_unitario
+    ):
+        comision_id, comision_monto = None, 0
     verificar_modulo_no_congelado(db, modulo_id)
 
     if not skip_inventario:
@@ -563,6 +649,9 @@ def crear_ventas(
             )
 
         ventas_realizadas.append(nueva)
+
+    # Pago dividido viejo de telefono (segunda peticion, la de tarjeta).
+    _restaurar_comision_telefono_dividido(db, venta, current_user, solo_comision_activa=False)
 
     db.commit()
     for v in ventas_realizadas:
