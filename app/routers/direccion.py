@@ -1919,28 +1919,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         .scalar()
     ) or 0
 
-    chip_rows_mes = (
-        db.query(
-            func.coalesce(models.VentaChip.tipo_chip, "(sin tipo)"),
-            func.count(models.VentaChip.id),
-        )
-        .join(models.Usuario, models.VentaChip.empleado_id == models.Usuario.id)
-        .filter(
-            models.VentaChip.fecha >= primer_dia,
-            models.VentaChip.fecha <= fecha,
-            models.VentaChip.cancelada.isnot(True),
-            or_(
-                models.Usuario.modulo_id.is_(None),
-                ~models.Usuario.modulo_id.in_(EXCLUIR_NUEVAS),
-            ),
-        )
-        .group_by(func.coalesce(models.VentaChip.tipo_chip, "(sin tipo)"))
-        .order_by(func.coalesce(models.VentaChip.tipo_chip, "(sin tipo)"))
-        .all()
-    )
-    chip_por_tipo = [(tc, int(c or 0)) for tc, c in chip_rows_mes]
-    chip_mes_total = sum(c for _, c in chip_por_tipo)
-
     # ── Generar PDF ───────────────────────────────────────────────────────────
     AZUL     = HexColor("#16264a")
     AMARILLO = HexColor("#f5c542")
@@ -1986,7 +1964,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     # GENERAL DEL DÍA y VENTAS POR MÓDULO.
     PAGO_H = BAR_H + 10
     COMP_H = HDR_H + (ROW_H * 4) + 10
-    CONT_H = HDR_H + (ROW_H * (5 + max(1, len(chip_por_tipo)))) + 10
+    CONT_H = HDR_H + (ROW_H * 5) + 10
     content_h += PAGO_H + COMP_H + CONT_H
 
     H = 82.0 + content_h + MARGEN
@@ -2172,17 +2150,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     _cont_row(2, "   Paguitos", tel_mes_paguitos)
     _cont_row(3, "   PayJoy",   tel_mes_payjoy)
     _cont_row(4, "Planes tarifarios", int(planes_mes), bold=True)
-    _cont_row(5, "Chips (total)", chip_mes_total, bold=True)
-    if not chip_por_tipo:
-        c.setFillColor(white)
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(black)
-        c.setFont("Helvetica-Oblique", 10)
-        c.drawString(MARGEN + 12, y - 11, "   (sin chips en el mes)")
-        y -= ROW_H
-    else:
-        for idx, (tipo, cant) in enumerate(chip_por_tipo):
-            _cont_row(6 + idx, f"   {tipo}", cant)
     y -= 10
 
     # ── VENTAS POR MÓDULO (cuadrícula 5 por fila) ─────────────────────────────
