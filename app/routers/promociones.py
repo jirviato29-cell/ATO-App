@@ -23,11 +23,10 @@ CLAVE_MICA_GRATIS = "MICHIDRO199"
 # Promos que se calculan aparte y conviven con 3X2/2DA30 en el mismo ticket.
 PROMOS_APARTE = {"FUNDAS30", MICA_GRATIS}
 
-# 3X2: dentro de cada grupo de 3 piezas la gratis (la más barata) debe tener
-# un precio de lista menor que la pieza más cara del grupo. En la práctica se
-# bloquea solo si las 3 piezas del grupo cuestan exactamente lo mismo.
+# 3X2: la pieza gratis debe ser estrictamente más barata que las otras dos.
+# En caso de empate en el menor precio (p.ej. 3 piezas iguales) no aplica.
 MENSAJE_3X2_IGUAL = (
-    "En el 3x2 las 3 piezas no pueden ser del mismo precio. "
+    "En el 3x2 la pieza gratis debe ser de menor precio que las otras dos. "
     "Cambia una pieza o usa 2.ª pieza al 30%."
 )
 
@@ -132,10 +131,9 @@ def calcular_precios_promo(codigo: str, renglones: List[dict], claves_promo: Opt
     if any(p > LIMITE_PIEZA_CARA for p, _ in con_descuento):
         raise ValueError(f"En {codigo} una pieza de más de $1,000 no puede llevar el descuento.")
 
-    if codigo == "3X2" and bloques > 0:
-        for k in range(bloques):
-            if piezas[k * grupo][0] == piezas[k * grupo + grupo - 1][0]:
-                raise ValueError(MENSAJE_3X2_IGUAL)
+    if codigo == "3X2" and bloques > 0 and n > bloques:
+        if piezas[bloques - 1][0] >= piezas[bloques][0]:
+            raise ValueError(MENSAJE_3X2_IGUAL)
 
     conteo: Counter = Counter()
     for i, (p, idx) in enumerate(piezas):
