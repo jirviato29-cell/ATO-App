@@ -1810,54 +1810,15 @@ def _generar_pdf_reporte(fecha: date, db: Session):
             })
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Secciones extra del reporte diario (regalados, forma de pago,
-    # comparativo año pasado, contadores del mes). Reglas comunes: sin ventas
-    # canceladas, sin módulo BO (21) ni prueba (20). Los chips no tienen
-    # modulo_id propio, se filtran por el modulo del empleado.
+    # Secciones extra del reporte diario (forma de pago, comparativo año
+    # pasado, contadores del mes). Reglas comunes: sin ventas canceladas, sin
+    # módulo BO (21) ni prueba (20). Los chips no tienen modulo_id propio, se
+    # filtran por el modulo del empleado.
     # ─────────────────────────────────────────────────────────────────────────
     EXCLUIR_NUEVAS = {20, 21}
     TARJETA_SET = {"tarjeta", "terminal"}
 
-    def _motivo_regalo(promo: Optional[str]) -> str:
-        cod = (promo or "").strip().upper()
-        if cod == "3X2":
-            return "3x2"
-        if cod == "MICA_GRATIS":
-            return "mica gratis con teléfono"
-        return "sin promoción"
-
-    # 1) PRODUCTOS REGALADOS DEL DÍA ──────────────────────────────────────────
-    regalados_rows = (
-        db.query(models.Venta, models.Modulo.nombre, models.Usuario.nombre_completo)
-        .join(models.Modulo, models.Venta.modulo_id == models.Modulo.id)
-        .join(models.Usuario, models.Venta.empleado_id == models.Usuario.id)
-        .filter(
-            models.Venta.fecha == fecha,
-            models.Venta.precio_unitario == 0,
-            models.Venta.cancelada.isnot(True),
-            ~models.Venta.modulo_id.in_(EXCLUIR_NUEVAS),
-        )
-        .order_by(models.Modulo.nombre.asc(), models.Venta.hora.asc())
-        .all()
-    )
-    regalados = []
-    reg_piezas = 0
-    reg_valor = 0.0
-    for v, mod_nombre, asesor in regalados_rows:
-        cant = int(v.cantidad or 0)
-        lista = float(v.precio_original or 0)
-        regalados.append({
-            "modulo": mod_nombre,
-            "asesor": asesor or "",
-            "producto": v.producto or "",
-            "cant": cant,
-            "lista": lista,
-            "motivo": _motivo_regalo(v.promocion),
-        })
-        reg_piezas += cant
-        reg_valor += lista * cant
-
-    # 2) FORMA DE PAGO ────────────────────────────────────────────────────────
+    # 1) FORMA DE PAGO ────────────────────────────────────────────────────────
     # Pago dividido se guarda como dos filas (efectivo + tarjeta) con el mismo
     # folio, cada una con su metodo_pago. Sumar por metodo_pago da el total real
     # cobrado en cada forma.
@@ -1889,7 +1850,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         bloque[key] += monto
     modulos_pago = sorted(pagos_por_mod.keys())
 
-    # 3) COMPARATIVO VS AÑO PASADO (fecha - 364 días, mismo día de la semana) ─
+    # 2) COMPARATIVO VS AÑO PASADO (fecha - 364 días, mismo día de la semana) ─
     fecha_ant = fecha - timedelta(days=364)
 
     def _totales_dia(f: date):
@@ -1927,7 +1888,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     comp_pct = (comp_dif / comp_tot_ant * 100.0) if comp_tot_ant > 0 else 0.0
     comp_rebaso = comp_tot_hoy > comp_tot_ant
 
-    # 4) CONTADORES DEL MES (día 1 a la fecha del reporte) ────────────────────
+    # 3) CONTADORES DEL MES (día 1 a la fecha del reporte) ────────────────────
     primer_dia = fecha.replace(day=1)
 
     # Teléfonos: tipo_venta IS NOT NULL excluye la parte tarjeta de los pagos
@@ -2027,13 +1988,12 @@ def _generar_pdf_reporte(fecha: date, db: Session):
                 content_h += HDR_H + len(r["acc_por_prod"]) * ROW_H
             content_h += SUB_H + 26
 
-    # Alturas de las 4 secciones nuevas (regalados, forma de pago,
-    # comparativo año pasado, contadores del mes).
-    REG_H  = HDR_H + (len(regalados) * ROW_H if regalados else 22) + SUB_H + 14
+    # Alturas de las 3 secciones nuevas (forma de pago, comparativo año
+    # pasado, contadores del mes).
     PAGO_H = HDR_H + HDR_H + (len(modulos_pago) * ROW_H if modulos_pago else 22) + SUB_H + 14
     COMP_H = HDR_H + (ROW_H * 4) + SUB_H + 14
     CONT_H = HDR_H + (ROW_H * (4 + max(1, len(chip_por_tipo)) + 2)) + 14
-    content_h += REG_H + PAGO_H + COMP_H + CONT_H
+    content_h += PAGO_H + COMP_H + CONT_H
 
     H = 82.0 + content_h + MARGEN
 
@@ -2234,61 +2194,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         y -= SUB_H + 26
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 1) PRODUCTOS REGALADOS DEL DÍA
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(NARANJA)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(CP, y - 13, "PRODUCTOS REGALADOS DEL DÍA")
-    y -= HDR_H
-
-    if not regalados:
-        c.setFillColor(black)
-        c.setFont("Helvetica-Oblique", 11)
-        c.drawString(MARGEN + 8, y - 14, "Sin productos regalados hoy")
-        y -= 22
-    else:
-        # encabezado de columnas
-        CMO = MARGEN + 4                  # módulo
-        CAS = MARGEN + 90                 # asesor
-        CPR = MARGEN + 200                # producto
-        CLI = W - MARGEN - 150            # precio lista (right)
-        CMT = W - MARGEN - 4              # motivo (right)
-        c.setFillColor(GRIS_T)
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(AZUL)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(CMO, y - 11, "MÓDULO")
-        c.drawString(CAS, y - 11, "ASESOR")
-        c.drawString(CPR, y - 11, "PRODUCTO")
-        c.drawRightString(CLI, y - 11, "P. LISTA")
-        c.drawRightString(CMT, y - 11, "MOTIVO")
-        y -= ROW_H
-        for idx, r in enumerate(regalados):
-            c.setFillColor(GRIS_F if idx % 2 == 0 else white)
-            c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-            c.setFillColor(black)
-            c.setFont("Helvetica", 9)
-            prod_txt = r["producto"][:32] + (f" (x{r['cant']})" if r["cant"] > 1 else "")
-            c.drawString(CMO, y - 11, r["modulo"][:16])
-            c.drawString(CAS, y - 11, r["asesor"][:20])
-            c.drawString(CPR, y - 11, prod_txt[:40])
-            c.drawRightString(CLI, y - 11, fp(r["lista"]) if r["lista"] else "—")
-            c.drawRightString(CMT, y - 11, r["motivo"])
-            y -= ROW_H
-    c.setFillColor(GRIS_T)
-    c.rect(MARGEN, y - SUB_H, ancho, SUB_H, fill=1, stroke=0)
-    c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(MARGEN + 6, y - 15, f"Total piezas regaladas: {reg_piezas}")
-    c.setFillColor(black)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawRightString(CT, y - 15, f"Valor a lista: {fp(reg_valor)}")
-    y -= SUB_H + 14
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 2) FORMA DE PAGO (efectivo vs tarjeta, general y por módulo)
+    # 1) FORMA DE PAGO (efectivo vs tarjeta, general y por módulo)
     # ─────────────────────────────────────────────────────────────────────────
     c.setFillColor(AZUL)
     c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
@@ -2336,7 +2242,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     y -= SUB_H + 14
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 3) COMPARATIVO VS EL AÑO PASADO (mismo día de la semana)
+    # 2) COMPARATIVO VS EL AÑO PASADO (mismo día de la semana)
     # ─────────────────────────────────────────────────────────────────────────
     c.setFillColor(VERDE if comp_rebaso else NARANJA)
     c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
@@ -2397,7 +2303,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     y -= SUB_H + 14
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 4) CONTADORES DEL MES (día 1 a la fecha del reporte)
+    # 3) CONTADORES DEL MES (día 1 a la fecha del reporte)
     # ─────────────────────────────────────────────────────────────────────────
     c.setFillColor(AZUL)
     c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
