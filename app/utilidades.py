@@ -71,6 +71,10 @@ def calcular_comision_telefono(v):
     # Contado con comisión especial: los $10 NO se suman
     if tipo == "Contado" and comision_base > 0:
         return comision_base * v.cantidad
+    # Vendido abajo del precio (comision_id=None y comision_monto=0): sin los
+    # $10 de Contado. Con comision_monto NULL se suman como siempre.
+    if v.comision_monto is not None and v.comision_monto == 0 and v.comision_id is None:
+        return 0
     extra = {"Contado": 10, "Paguitos": 110, "Pajoy": 100}.get(tipo, 0)
     return (comision_base + extra) * v.cantidad
 

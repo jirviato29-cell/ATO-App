@@ -7,6 +7,16 @@ from sqlalchemy import case, func
 from app.congelamiento import aplicar_congelamiento, dias_congelados_batch
 
 
+# Telefono vendido abajo del precio (ventas.py lo marca con comision_id=None y
+# comision_monto=0): no lleva los $10 de Contado. Con comision_monto NULL (el
+# caso normal y todo el historico) los $10 se siguen sumando como siempre.
+_ABAJO_DEL_PRECIO = (models.Venta.comision_monto == 0) & models.Venta.comision_id.is_(None)
+
+
+def _abajo_del_precio(v) -> bool:
+    return v.comision_monto is not None and v.comision_monto == 0 and v.comision_id is None
+
+
 
 from sqlalchemy import func, case
 
@@ -32,6 +42,7 @@ def _comisiones_detalle(db: Session, inicio: date, fin: date) -> dict:
     """
     _base = func.coalesce(models.Comision.cantidad, 0)
     _extra = case(
+        (_ABAJO_DEL_PRECIO, 0),
         (models.Venta.tipo_venta == "Contado",  10),
         (models.Venta.tipo_venta == "Pajoy",   100),
         (models.Venta.tipo_venta == "Paguitos",110),
@@ -160,6 +171,7 @@ def obtener_desglose_comisiones_por_empleado(db: Session, inicio: date, fin: dat
                          else_=(
                              func.coalesce(models.Comision.cantidad, 0) +
                              case(
+                                 (_ABAJO_DEL_PRECIO, 0),
                                  (models.Venta.tipo_venta == "Contado",  10),
                                  (models.Venta.tipo_venta == "Pajoy",   100),
                                  (models.Venta.tipo_venta == "Paguitos",110),
@@ -283,6 +295,8 @@ def calcular_totales_comisiones(
             tipo = v.tipo_venta or ""
             if tipo == "Contado" and comision_base > 0:
                 comision_total = comision_base * cantidad
+            elif _abajo_del_precio(v):
+                comision_total = 0.0
             else:
                 comision_total = (comision_base + _extra_por_tipo.get(tipo, 0)) * cantidad
             comision_total, marcado = aplicar_congelamiento(

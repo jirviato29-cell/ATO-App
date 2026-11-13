@@ -133,6 +133,9 @@ def calcular_comisiones(db, empleado_id, inicio, fin):
         if getattr(v, "tipo_producto", "") == "telefono":
             if tipo_venta == "contado" and comision_base > 0:
                 comision_total = comision_base * cantidad
+            elif v.comision_monto is not None and v.comision_monto == 0 and v.comision_id is None:
+                # Vendido abajo del precio: sin los $10 de Contado.
+                comision_total = 0
             else:
                 comision_extra = comisiones_por_tipo.get(tipo_venta, 0)
                 comision_total = (comision_base + comision_extra) * cantidad
