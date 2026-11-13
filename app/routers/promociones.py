@@ -23,6 +23,18 @@ CLAVE_MICA_GRATIS = "MICHIDRO199"
 # Promos que se calculan aparte y conviven con 3X2/2DA30 en el mismo ticket.
 PROMOS_APARTE = {"FUNDAS30", MICA_GRATIS}
 
+# 3X2: la pieza gratis debe ser estrictamente más barata que las otras dos, salvo
+# que sea un protector o una mica (se identifican por el nombre del producto).
+MENSAJE_3X2_IGUAL = (
+    "En el 3x2 la pieza gratis debe ser de menor precio que las otras dos "
+    "(excepto protectores y micas). Cambia una pieza o usa 2.ª pieza al 30%."
+)
+
+
+def _es_protector_mica(nombre: Optional[str]) -> bool:
+    n = (nombre or "").strip().upper()
+    return n.startswith("PROTECTOR") or n.startswith("MICA")
+
 
 def hoy_mx() -> date:
     return datetime.now(ZONA).date()
@@ -106,26 +118,41 @@ def calcular_precios_promo(codigo: str, renglones: List[dict], claves_promo: Opt
     else:
         raise ValueError(f"La promoción {codigo} no está soportada.")
 
-    piezas = [(float(r["precio_original"]), r["idx"]) for r in renglones for _ in range(r["cantidad"])]
+    piezas = [
+        (float(r["precio_original"]), r["idx"], str(r.get("producto") or ""))
+        for r in renglones
+        for _ in range(r["cantidad"])
+    ]
     n = len(piezas)
     if n == 0 or n % grupo != 0:
         raise ValueError(f"La promoción {codigo} requiere un número de piezas múltiplo de {grupo} (llevas {n}).")
 
     bloques = n // grupo
-    caras = sum(1 for p, _ in piezas if p > LIMITE_PIEZA_CARA)
+    caras = sum(1 for p, _, _ in piezas if p > LIMITE_PIEZA_CARA)
     if caras > bloques:
         raise ValueError(
             f"En {codigo} solo se permite 1 pieza de más de $1,000 por cada {grupo} piezas "
             f"(llevas {caras} en {n} piezas)."
         )
 
-    piezas.sort(key=lambda x: (x[0], x[1]))
+    # En 3X2, con empate de precio preferimos que la pieza gratis sea un
+    # protector/mica para aprovechar la excepción de nombre.
+    if codigo == "3X2":
+        piezas.sort(key=lambda x: (x[0], 0 if _es_protector_mica(x[2]) else 1, x[1]))
+    else:
+        piezas.sort(key=lambda x: (x[0], x[1]))
     con_descuento = piezas[:bloques]
-    if any(p > LIMITE_PIEZA_CARA for p, _ in con_descuento):
+    if any(p > LIMITE_PIEZA_CARA for p, _, _ in con_descuento):
         raise ValueError(f"En {codigo} una pieza de más de $1,000 no puede llevar el descuento.")
 
+    if codigo == "3X2" and bloques > 0 and n > bloques:
+        precio_borde = piezas[bloques][0]
+        for precio, _idx, nombre in con_descuento:
+            if precio >= precio_borde and not _es_protector_mica(nombre):
+                raise ValueError(MENSAJE_3X2_IGUAL)
+
     conteo: Counter = Counter()
-    for i, (p, idx) in enumerate(piezas):
+    for i, (p, idx, _nombre) in enumerate(piezas):
         precio = round(p * factor, 2) if i < bloques else round(p, 2)
         conteo[(idx, precio)] += 1
     return sorted(
@@ -212,7 +239,13 @@ def preparar_renglones_promocion(
             rechazar(f"No se encontró el precio de la clave {clave} en el inventario general.")
         precio_original = float(inv.precio)
         renglones_por_codigo.setdefault(cod, []).append(
-            {"idx": idx, "cantidad": item.cantidad, "precio_original": precio_original, "clave": clave}
+            {
+                "idx": idx,
+                "cantidad": item.cantidad,
+                "precio_original": precio_original,
+                "clave": clave,
+                "producto": item.producto,
+            }
         )
         originales[idx] = precio_original
 
