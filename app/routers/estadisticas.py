@@ -235,14 +235,14 @@ def ranking_modulos_hoy(
                    SUM(CASE WHEN tipo_producto = 'accesorios'
                             THEN COALESCE(total, precio_unitario * cantidad) ELSE 0 END) AS monto
             FROM ventas
-            WHERE fecha = :dia AND (cancelada IS NULL OR cancelada = false)
+            WHERE fecha = :dia AND (cancelada IS NULL OR cancelada = false) AND (devuelta IS NULL OR devuelta = false)
             GROUP BY modulo_id
         ) acc ON acc.modulo_id = m.id
         LEFT JOIN (
             SELECT modulo_id, SUM(cantidad) AS cant
             FROM ventas
             WHERE fecha = :dia AND tipo_producto = 'telefono'
-              AND (cancelada IS NULL OR cancelada = false)
+              AND (cancelada IS NULL OR cancelada = false) AND (devuelta IS NULL OR devuelta = false)
             GROUP BY modulo_id
         ) tel ON tel.modulo_id = m.id
         LEFT JOIN (
@@ -258,7 +258,7 @@ def ranking_modulos_hoy(
                             THEN COALESCE(total, precio_unitario * cantidad) ELSE 0 END) AS monto
             FROM ventas
             WHERE date_trunc('month', fecha) = date_trunc('month', CAST(:dia AS date))
-              AND (cancelada IS NULL OR cancelada = false)
+              AND (cancelada IS NULL OR cancelada = false) AND (devuelta IS NULL OR devuelta = false)
             GROUP BY modulo_id
         ) accm ON accm.modulo_id = m.id
         LEFT JOIN (
@@ -266,7 +266,7 @@ def ranking_modulos_hoy(
             FROM ventas
             WHERE date_trunc('month', fecha) = date_trunc('month', CAST(:dia AS date))
               AND tipo_producto = 'telefono'
-              AND (cancelada IS NULL OR cancelada = false)
+              AND (cancelada IS NULL OR cancelada = false) AND (devuelta IS NULL OR devuelta = false)
             GROUP BY modulo_id
         ) telm ON telm.modulo_id = m.id
         WHERE m.activo = true AND m.id NOT IN (7, 21)
