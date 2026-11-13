@@ -27,6 +27,7 @@ DIAS = ("Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom")
 # Acceso: /hoy y /dia para cualquier usuario (venta y nivel del modulo).
 # /mi-avance para cualquier usuario con modulo: solo su modulo y su propia fila.
 # /mi-semana igual: los 7 dias de la semana en curso, solo sus propios bonos.
+# /mi-pendiente: bono de la semana pasada, sumando todas sus claves.
 # /asesores y /semana solo admin y direccion: exponen lo que cobra cada asesor.
 # /config solo admin.
 #
@@ -215,6 +216,55 @@ def metas_mi_semana(
         "domingo": domingo.isoformat(),
         "dias": dias,
         "total": sum(d["bono"] for d in dias),
+    }
+
+
+def _numero(valor) -> int | float:
+    # numeric de Postgres llega como Decimal: 661 sale como 661, no "661.00".
+    return int(valor) if valor == int(valor) else float(valor)
+
+
+@router.get("/mi-pendiente")
+def metas_mi_pendiente(
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_user),
+):
+    # Bono de la semana pasada (lunes a domingo) que se le debe al usuario del token.
+    # Una persona puede tener una clave por modulo: se suman todas las que
+    # comparten nombre_completo. Sin renglon o en cero: 204, no es un error.
+    #
+    # "Hoy" sale de la zona de Mexico, no de CURRENT_DATE (que en la BD es
+    # UTC): asi la semana no rota el domingo en la noche.
+    fila = db.execute(text("""
+        WITH mis_claves AS (
+          SELECT u2.id
+          FROM usuarios u2
+          WHERE u2.nombre_completo = (SELECT u.nombre_completo
+                                        FROM usuarios u
+                                       WHERE u.id = :empleado_id)
+        )
+        SELECT
+          s.lunes,
+          s.domingo,
+          (CAST(:hoy AS date)
+            + ((3 - EXTRACT(ISODOW FROM CAST(:hoy AS date))::int + 7) % 7)) AS paga_el,
+          COUNT(DISTINCT s.empleado_id) AS claves,
+          COALESCE(SUM(s.a_pagar), 0) AS bono_pendiente
+        FROM v_bolsa_semanal s
+        WHERE s.lunes = (date_trunc('week', CAST(:hoy AS date))::date - 7)
+          AND s.empleado_id IN (SELECT id FROM mis_claves)
+        GROUP BY s.lunes, s.domingo
+    """), {"hoy": _hoy(), "empleado_id": current_user.id}).mappings().first()
+
+    if fila is None or not fila["bono_pendiente"]:
+        return Response(status_code=204)
+
+    return {
+        "lunes": fila["lunes"].isoformat(),
+        "domingo": fila["domingo"].isoformat(),
+        "paga_el": fila["paga_el"].isoformat(),
+        "claves": fila["claves"],
+        "bono_pendiente": _numero(fila["bono_pendiente"]),
     }
 
 
