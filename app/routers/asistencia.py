@@ -1114,6 +1114,9 @@ def resolver_solicitud_correccion(
 
 ROLES_CANDADO = ("asesor", "encargado")
 
+# Usuarios que operan como cuenta de prueba y no deben ver el modal de candado.
+USUARIOS_SIN_CANDADO_CHECKIN = {"A55BO-EVELYN"}
+
 
 def _cuentas_englobadas(db: Session, current_user):
     """Todas las cuentas de la misma persona (mismo nombre_englobado)."""
@@ -1132,7 +1135,8 @@ def _cuentas_englobadas(db: Session, current_user):
 
 def _estado_dia(db: Session, current_user, hoy: date) -> dict:
     """Calcula si la persona ya cumplió el requisito de asistencia de hoy."""
-    if current_user.rol not in ROLES_CANDADO:
+    username = (current_user.username or "").strip().upper()
+    if current_user.rol not in ROLES_CANDADO or username in USUARIOS_SIN_CANDADO_CHECKIN:
         return {
             "aplica_candado": False,
             "puede_usar": True,
