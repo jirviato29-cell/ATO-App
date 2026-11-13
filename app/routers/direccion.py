@@ -1818,13 +1818,12 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     EXCLUIR_NUEVAS = {20, 21}
     TARJETA_SET = {"tarjeta", "terminal"}
 
-    # 1) FORMA DE PAGO ────────────────────────────────────────────────────────
+    # 1) FORMA DE PAGO (solo totales generales) ───────────────────────────────
     # Pago dividido se guarda como dos filas (efectivo + tarjeta) con el mismo
     # folio, cada una con su metodo_pago. Sumar por metodo_pago da el total real
     # cobrado en cada forma.
     pago_rows = (
-        db.query(models.Venta, models.Modulo.nombre)
-        .join(models.Modulo, models.Venta.modulo_id == models.Modulo.id)
+        db.query(models.Venta.precio_unitario, models.Venta.cantidad, models.Venta.metodo_pago)
         .filter(
             models.Venta.fecha == fecha,
             models.Venta.cancelada.isnot(True),
@@ -1832,23 +1831,15 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         )
         .all()
     )
-    pagos_por_mod: dict = {}
     pago_tot_ef = 0.0
     pago_tot_tar = 0.0
-    for v, nombre_mod in pago_rows:
-        monto = float((v.precio_unitario or 0) * (v.cantidad or 0))
-        pago = (v.metodo_pago or "").strip().lower()
-        if pago in EFECTIVO_SET:
-            key = "ef"
+    for precio, cant, mp in pago_rows:
+        monto = float((precio or 0) * (cant or 0))
+        m = (mp or "").strip().lower()
+        if m in EFECTIVO_SET:
             pago_tot_ef += monto
-        elif pago in TARJETA_SET:
-            key = "tar"
+        elif m in TARJETA_SET:
             pago_tot_tar += monto
-        else:
-            continue
-        bloque = pagos_por_mod.setdefault(nombre_mod, {"ef": 0.0, "tar": 0.0})
-        bloque[key] += monto
-    modulos_pago = sorted(pagos_por_mod.keys())
 
     # 2) COMPARATIVO VS AÑO PASADO (fecha - 364 días, mismo día de la semana) ─
     fecha_ant = fecha - timedelta(days=364)
@@ -1984,15 +1975,18 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         else:
             if r["tel_por_prod"]:
                 content_h += HDR_H + len(r["tel_por_prod"]) * ROW_H
-            if r["acc_por_prod"]:
-                content_h += HDR_H + len(r["acc_por_prod"]) * ROW_H
+            # Los accesorios regalados (total $0) no se muestran en el detalle
+            # por módulo, así que no suman altura.
+            acc_vis = sum(1 for d in r["acc_por_prod"].values() if d["total"] > 0)
+            if acc_vis:
+                content_h += HDR_H + acc_vis * ROW_H
             content_h += SUB_H + 26
 
-    # Alturas de las 3 secciones nuevas (forma de pago, comparativo año
-    # pasado, contadores del mes).
-    PAGO_H = HDR_H + HDR_H + (len(modulos_pago) * ROW_H if modulos_pago else 22) + SUB_H + 14
-    COMP_H = HDR_H + (ROW_H * 4) + SUB_H + 14
-    CONT_H = HDR_H + (ROW_H * (4 + max(1, len(chip_por_tipo)) + 2)) + 14
+    # Alturas de las 3 secciones compactas que se dibujan arriba, entre TOTAL
+    # GENERAL DEL DÍA y VENTAS POR MÓDULO.
+    PAGO_H = BAR_H + 10
+    COMP_H = HDR_H + (ROW_H * 4) + 10
+    CONT_H = HDR_H + (ROW_H * (5 + max(1, len(chip_por_tipo)))) + 10
     content_h += PAGO_H + COMP_H + CONT_H
 
     H = 82.0 + content_h + MARGEN
@@ -2070,6 +2064,126 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     c.drawString(MARGEN + 8, y - 23, "TOTAL GENERAL DEL DÍA")
     c.drawRightString(CT, y - 23, fp(res_tot))
     y -= BAR_H + 12
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FORMA DE PAGO — solo totales generales (efectivo vs terminal)
+    # ─────────────────────────────────────────────────────────────────────────
+    c.setFillColor(AZUL)
+    c.rect(MARGEN, y - BAR_H, ancho, BAR_H, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(MARGEN + 8, y - 20, "FORMA DE PAGO")
+    c.setFont("Helvetica-Bold", 11)
+    col_ef = MARGEN + 300
+    c.drawString(col_ef, y - 20, "Efectivo:")
+    c.drawRightString(col_ef + 110, y - 20, fp(pago_tot_ef))
+    c.drawString(col_ef + 125, y - 20, "Terminal:")
+    c.drawRightString(CT - 4, y - 20, fp(pago_tot_tar))
+    y -= BAR_H + 10
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # COMPARATIVO CONTRA EL AÑO PASADO (compacto)
+    # ─────────────────────────────────────────────────────────────────────────
+    hoy_str = fecha.strftime("%d/%m/%Y")
+    ant_str = fecha_ant.strftime("%d/%m/%Y")
+    c.setFillColor(VERDE if comp_rebaso else NARANJA)
+    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(CP, y - 13, f"COMPARATIVO CONTRA EL AÑO PASADO  ({hoy_str} vs {ant_str})")
+    etq = "SE REBASÓ" if comp_rebaso else "NO SE REBASÓ"
+    if comp_tot_ant > 0:
+        signo_pct = "+" if comp_dif >= 0 else "−"
+        pct_txt = f"{signo_pct}{abs(comp_pct):.1f}%"
+    else:
+        pct_txt = "—"
+    c.drawRightString(CT, y - 13, f"{etq}   {pct_txt}")
+    y -= HDR_H
+
+    # columnas
+    col_hoy = MARGEN + 230
+    col_ant = MARGEN + 350
+    col_dif = W - MARGEN - 90
+    col_pct = CT
+    c.setFillColor(GRIS_T)
+    c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
+    c.setFillColor(AZUL)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(MARGEN + 6, y - 11, "CONCEPTO")
+    c.drawRightString(col_hoy, y - 11, hoy_str)
+    c.drawRightString(col_ant, y - 11, ant_str)
+    c.drawRightString(col_dif, y - 11, "DIFERENCIA")
+    c.drawRightString(col_pct, y - 11, "%")
+    y -= ROW_H
+
+    def _comp_row(idx: int, lbl: str, hoy_v: float, ant_v: float, es_total: bool = False) -> float:
+        nonlocal y
+        c.setFillColor(GRIS_T if es_total else (GRIS_F if idx % 2 == 0 else white))
+        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
+        c.setFillColor(AZUL if es_total else black)
+        c.setFont("Helvetica-Bold" if es_total else "Helvetica", 10)
+        c.drawString(MARGEN + 6, y - 11, lbl)
+        c.drawRightString(col_hoy, y - 11, fp(hoy_v))
+        c.setFillColor(black)
+        c.setFont("Helvetica" if not es_total else "Helvetica-Bold", 10)
+        c.drawRightString(col_ant, y - 11, fp(ant_v))
+        dif = hoy_v - ant_v
+        c.setFillColor(VERDE if dif >= 0 else NARANJA)
+        c.setFont("Helvetica-Bold", 10)
+        signo = "+" if dif >= 0 else "−"
+        c.drawRightString(col_dif, y - 11, f"{signo}{fp(abs(dif))}")
+        if ant_v > 0:
+            pct = dif / ant_v * 100
+            spct = "+" if dif >= 0 else "−"
+            c.drawRightString(col_pct, y - 11, f"{spct}{abs(pct):.1f}%")
+        else:
+            c.drawRightString(col_pct, y - 11, "—")
+        y -= ROW_H
+        return y
+
+    _comp_row(0, "Accesorios", comp_acc_hoy, comp_acc_ant)
+    _comp_row(1, "Teléfonos",  comp_tel_hoy, comp_tel_ant)
+    _comp_row(2, "TOTAL",      comp_tot_hoy, comp_tot_ant, es_total=True)
+    y -= 10
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONTADORES DEL MES (día 1 a la fecha del reporte)
+    # ─────────────────────────────────────────────────────────────────────────
+    c.setFillColor(AZUL)
+    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(CP, y - 13, f"CONTADORES DEL MES  ({primer_dia.strftime('%d/%m')} – {fecha.strftime('%d/%m')})")
+    y -= HDR_H
+
+    def _cont_row(idx: int, lbl: str, cant: int, bold: bool = False) -> float:
+        nonlocal y
+        c.setFillColor(GRIS_T if bold else (GRIS_F if idx % 2 == 0 else white))
+        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
+        c.setFillColor(AZUL if bold else black)
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
+        c.drawString(MARGEN + 6, y - 11, lbl)
+        c.drawRightString(CT, y - 11, str(cant))
+        y -= ROW_H
+        return y
+
+    _cont_row(0, "Teléfonos vendidos (total)", tel_mes_total, bold=True)
+    _cont_row(1, "   Contado",  tel_mes_contado)
+    _cont_row(2, "   Paguitos", tel_mes_paguitos)
+    _cont_row(3, "   PayJoy",   tel_mes_payjoy)
+    _cont_row(4, "Planes tarifarios", int(planes_mes), bold=True)
+    _cont_row(5, "Chips (total)", chip_mes_total, bold=True)
+    if not chip_por_tipo:
+        c.setFillColor(white)
+        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
+        c.setFillColor(black)
+        c.setFont("Helvetica-Oblique", 10)
+        c.drawString(MARGEN + 12, y - 11, "   (sin chips en el mes)")
+        y -= ROW_H
+    else:
+        for idx, (tipo, cant) in enumerate(chip_por_tipo):
+            _cont_row(6 + idx, f"   {tipo}", cant)
+    y -= 10
 
     # ── VENTAS POR MÓDULO (cuadrícula 5 por fila) ─────────────────────────────
     # Barra de título
@@ -2166,9 +2280,11 @@ def _generar_pdf_reporte(fecha: date, db: Session):
             for idx, (prod, datos) in enumerate(sorted(r["tel_por_prod"].items())):
                 y = tabla_row(y, prod, datos, idx)
 
-        if r["acc_por_prod"]:
+        # Oculta accesorios con total $0 (piezas regaladas por promocion).
+        acc_visibles = [(prod, d) for prod, d in sorted(r["acc_por_prod"].items()) if d["total"] > 0]
+        if acc_visibles:
             y = tabla_hdr(y, "ACCESORIOS", bg=NARANJA, fg=white)
-            for idx, (prod, datos) in enumerate(sorted(r["acc_por_prod"].items())):
+            for idx, (prod, datos) in enumerate(acc_visibles):
                 y = tabla_row(y, prod, datos, idx)
 
         c.setFillColor(GRIS_T)
@@ -2192,152 +2308,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         c.setFont("Helvetica-Bold", 12)
         c.drawRightString(CT, y - 15, fp(r["mod_tot"]))
         y -= SUB_H + 26
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 1) FORMA DE PAGO (efectivo vs tarjeta, general y por módulo)
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(AZUL)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(CP, y - 13, "FORMA DE PAGO")
-    y -= HDR_H
-
-    # encabezado columnas
-    CMO2 = MARGEN + 6
-    CEF  = W - MARGEN - 150
-    CTA  = W - MARGEN - 4
-    c.setFillColor(GRIS_T)
-    c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-    c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(CMO2, y - 11, "MÓDULO")
-    c.drawRightString(CEF, y - 11, "EFECTIVO")
-    c.drawRightString(CTA, y - 11, "TARJETA")
-    y -= ROW_H
-
-    if not modulos_pago:
-        c.setFillColor(black)
-        c.setFont("Helvetica-Oblique", 11)
-        c.drawString(MARGEN + 8, y - 14, "Sin ventas hoy")
-        y -= 22
-    else:
-        for idx, nombre_mod in enumerate(modulos_pago):
-            c.setFillColor(GRIS_F if idx % 2 == 0 else white)
-            c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-            c.setFillColor(black)
-            c.setFont("Helvetica", 10)
-            b = pagos_por_mod[nombre_mod]
-            c.drawString(CMO2, y - 11, nombre_mod[:28])
-            c.drawRightString(CEF, y - 11, fp(b["ef"]))
-            c.drawRightString(CTA, y - 11, fp(b["tar"]))
-            y -= ROW_H
-    c.setFillColor(AMARILLO)
-    c.rect(MARGEN, y - SUB_H, ancho, SUB_H, fill=1, stroke=0)
-    c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(CMO2, y - 15, "TOTAL GENERAL")
-    c.drawRightString(CEF, y - 15, fp(pago_tot_ef))
-    c.drawRightString(CTA, y - 15, fp(pago_tot_tar))
-    y -= SUB_H + 14
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 2) COMPARATIVO VS EL AÑO PASADO (mismo día de la semana)
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(VERDE if comp_rebaso else NARANJA)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(CP, y - 13, "COMPARATIVO CONTRA EL AÑO PASADO")
-    ant_str = fecha_ant.strftime("%d/%m/%Y")
-    hoy_str = fecha.strftime("%d/%m/%Y")
-    c.drawRightString(CT, y - 13, f"{hoy_str} vs {ant_str}")
-    y -= HDR_H
-
-    def _comp_row(idx: int, lbl: str, hoy_v: float, ant_v: float, es_total: bool = False) -> None:
-        nonlocal y
-        c.setFillColor(GRIS_T if es_total else (GRIS_F if idx % 2 == 0 else white))
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(AZUL if es_total else black)
-        c.setFont("Helvetica-Bold" if es_total else "Helvetica", 10)
-        c.drawString(MARGEN + 6, y - 11, lbl)
-        # columnas: hoy | año pasado | diferencia
-        col_hoy = MARGEN + 230
-        col_ant = MARGEN + 370
-        c.drawRightString(col_hoy, y - 11, fp(hoy_v))
-        c.setFillColor(black)
-        c.setFont("Helvetica", 10)
-        c.drawRightString(col_ant, y - 11, fp(ant_v))
-        dif = hoy_v - ant_v
-        c.setFillColor(VERDE if dif >= 0 else NARANJA)
-        c.setFont("Helvetica-Bold", 10)
-        signo = "+" if dif >= 0 else "−"
-        c.drawRightString(CT, y - 11, f"{signo}{fp(abs(dif))}")
-        y -= ROW_H
-
-    # subencabezado con nombres de columna
-    c.setFillColor(GRIS_T)
-    c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-    c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(MARGEN + 6, y - 11, "CONCEPTO")
-    c.drawRightString(MARGEN + 230, y - 11, hoy_str)
-    c.drawRightString(MARGEN + 370, y - 11, ant_str)
-    c.drawRightString(CT, y - 11, "DIFERENCIA")
-    y -= ROW_H
-    _comp_row(0, "Accesorios", comp_acc_hoy, comp_acc_ant)
-    _comp_row(1, "Teléfonos",  comp_tel_hoy, comp_tel_ant)
-    _comp_row(2, "TOTAL",      comp_tot_hoy, comp_tot_ant, es_total=True)
-    # resultado final
-    c.setFillColor(GRIS_T)
-    c.rect(MARGEN, y - SUB_H, ancho, SUB_H, fill=1, stroke=0)
-    c.setFillColor(VERDE if comp_rebaso else NARANJA)
-    c.setFont("Helvetica-Bold", 12)
-    etiqueta = "SE REBASÓ el año pasado" if comp_rebaso else "NO se rebasó el año pasado"
-    c.drawString(MARGEN + 6, y - 15, etiqueta)
-    if comp_tot_ant > 0:
-        signo_pct = "+" if comp_dif >= 0 else "−"
-        c.drawRightString(CT, y - 15, f"{signo_pct}{abs(comp_pct):.1f} %")
-    else:
-        c.drawRightString(CT, y - 15, "—")
-    y -= SUB_H + 14
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 3) CONTADORES DEL MES (día 1 a la fecha del reporte)
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(AZUL)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(CP, y - 13, f"CONTADORES DEL MES ({primer_dia.strftime('%d/%m')} – {fecha.strftime('%d/%m')})")
-    y -= HDR_H
-
-    def _cont_row(idx: int, lbl: str, cant: int, bold: bool = False) -> None:
-        nonlocal y
-        c.setFillColor(GRIS_T if bold else (GRIS_F if idx % 2 == 0 else white))
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(AZUL if bold else black)
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
-        c.drawString(MARGEN + 6, y - 11, lbl)
-        c.drawRightString(CT, y - 11, str(cant))
-        y -= ROW_H
-
-    _cont_row(0, "Teléfonos vendidos (total)", tel_mes_total, bold=True)
-    _cont_row(1, "   Contado",  tel_mes_contado)
-    _cont_row(2, "   Paguitos", tel_mes_paguitos)
-    _cont_row(3, "   PayJoy",   tel_mes_payjoy)
-    _cont_row(4, "Planes tarifarios", int(planes_mes), bold=True)
-    _cont_row(5, "Chips (total)", chip_mes_total, bold=True)
-    if not chip_por_tipo:
-        c.setFillColor(white)
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(black)
-        c.setFont("Helvetica-Oblique", 10)
-        c.drawString(MARGEN + 12, y - 11, "   (sin chips en el mes)")
-        y -= ROW_H
-    else:
-        for idx, (tipo, cant) in enumerate(chip_por_tipo):
-            _cont_row(6 + idx, f"   {tipo}", cant)
 
     c.save()
     buf.seek(0)
