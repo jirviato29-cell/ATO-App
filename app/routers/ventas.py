@@ -1386,6 +1386,34 @@ def crear_ventas_multiples(
                 ventas_realizadas.append(nueva)
                 continue
 
+            # Tipo real del producto segun el catalogo (inventario_general), no por
+            # el nombre: un telefono cuyo nombre no dice "TELEFONO" (ej. tablets)
+            # no debe venderse como accesorio. Va antes de tocar la base.
+            producto_catalogo = None
+            if item.clave and item.clave.strip():
+                producto_catalogo = (
+                    db.query(models.InventarioGeneral)
+                    .filter(func.upper(func.trim(models.InventarioGeneral.clave)) == item.clave.strip().upper())
+                    .first()
+                )
+            if producto_catalogo is None:
+                producto_catalogo = (
+                    db.query(models.InventarioGeneral)
+                    .filter(func.upper(func.trim(models.InventarioGeneral.producto)) == item.producto.strip().upper())
+                    .first()
+                )
+            # parte_tarjeta: fila en tarjeta de un pago dividido; su fila en efectivo
+            # (que va primero) ya paso por esta validacion.
+            if (
+                not parte_tarjeta
+                and producto_catalogo
+                and (producto_catalogo.tipo_producto or "").strip().lower() == "telefono"
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{item.producto} es teléfono. Regístralo en la sección de Teléfonos con su IMEI.",
+                )
+
             skip_comision = parte_tarjeta or item.skip_comision
             skip_inventario = parte_tarjeta or item.skip_inventario
 
@@ -1430,12 +1458,16 @@ def crear_ventas_multiples(
 
                 inventario.cantidad -= item.cantidad
 
-            # detectar tipo de producto buscando la palabra TELEFONO en cualquier parte
-            tipo_producto = (
-                "telefono"
-                if "TELEFONO" in item.producto.strip().upper()
-                else "accesorios"
-            )
+            # Tipo segun el catalogo; si el producto no esta en inventario_general,
+            # respaldo: detectar la palabra TELEFONO en cualquier parte del nombre
+            if producto_catalogo:
+                tipo_producto = (producto_catalogo.tipo_producto or "accesorios").strip().lower()
+            else:
+                tipo_producto = (
+                    "telefono"
+                    if "TELEFONO" in item.producto.strip().upper()
+                    else "accesorios"
+                )
 
             nueva = models.Venta(
                 empleado_id=current_user.id,
