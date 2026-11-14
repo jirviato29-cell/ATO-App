@@ -1788,9 +1788,12 @@ def _generar_pdf_reporte(fecha: date, db: Session):
                     tel_ef  += monto
                 else:
                     tel_tar += monto
-                ent = tel_por_prod.setdefault(v.producto or "Sin nombre", {"cant": 0, "total": 0.0})
+                ent = tel_por_prod.setdefault(v.producto or "Sin nombre", {"cant": 0, "total": 0.0, "tipos": set()})
                 ent["cant"]  += int(v.cantidad or 0)
                 ent["total"] += monto
+                tv = (v.tipo_venta or "").strip().lower()
+                if tv:
+                    ent["tipos"].add(tv)
             elif tipo == "accesorios":
                 ent = acc_por_prod.setdefault(v.producto or "Sin nombre", {"cant": 0, "total": 0.0})
                 ent["cant"]  += int(v.cantidad or 0)
@@ -1823,6 +1826,21 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     )
 
     # ── Lista global de teléfonos (para la sección "TELÉFONOS VENDIDOS HOY") ─
+    def _tipo_label(tipos: set) -> str:
+        """Etiqueta de la columna TIPO; consolida 'pajoy' y 'payjoy' en PayJoy."""
+        norm = {"payjoy" if t in ("payjoy", "pajoy") else t for t in tipos}
+        if not norm:
+            return ""
+        if len(norm) > 1:
+            return "Mixto"
+        t = next(iter(norm))
+        return {
+            "contado":  "Contado",
+            "paguitos": "Paguitos",
+            "payjoy":   "PayJoy",
+            "plan":     "Plan",
+        }.get(t, t.title())
+
     tel_global = []
     for r in resultados:
         for modelo, datos in sorted(r["tel_por_prod"].items()):
@@ -1831,6 +1849,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
                 "modulo": r["nombre"],
                 "cant":   datos["cant"],
                 "total":  datos["total"],
+                "tipo":   _tipo_label(datos.get("tipos", set())),
             })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2067,11 +2086,16 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     y -= CARD_H + 18
 
     # ── TELÉFONOS VENDIDOS HOY (tabla angosta alineada a la izquierda) ───────
-    TBL_TEL_W = 300
-    TBL_MOD_W = 45
-    TBL_PRC_W = 75
-    TBL_W = TBL_TEL_W + TBL_MOD_W + TBL_PRC_W  # 420
+    TBL_TEL_W  = 300
+    TBL_MOD_W  = 45
+    TBL_TIPO_W = 60
+    TBL_PRC_W  = 75
+    TBL_W = TBL_TEL_W + TBL_MOD_W + TBL_TIPO_W + TBL_PRC_W  # 480
     TBL_ROW_H = 13
+    # Posiciones X derechas de cada columna (right-aligned).
+    X_MOD  = MARGEN + TBL_TEL_W + TBL_MOD_W - 2
+    X_TIPO = MARGEN + TBL_TEL_W + TBL_MOD_W + TBL_TIPO_W - 2
+    X_PRC  = MARGEN + TBL_W - 2
 
     need(HDR_H + TBL_ROW_H)
     c.setFillColor(VERDE)
@@ -2079,8 +2103,9 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 10)
     c.drawString(MARGEN + 4, y - 13, "TELÉFONOS VENDIDOS HOY")
-    c.drawRightString(MARGEN + TBL_TEL_W + TBL_MOD_W - 2, y - 13, "MÓD.")
-    c.drawRightString(MARGEN + TBL_W - 2, y - 13, "PRECIO")
+    c.drawRightString(X_MOD,  y - 13, "MÓD.")
+    c.drawRightString(X_TIPO, y - 13, "TIPO")
+    c.drawRightString(X_PRC,  y - 13, "PRECIO")
     y -= HDR_H
 
     if not tel_global:
@@ -2104,8 +2129,9 @@ def _generar_pdf_reporte(fecha: date, db: Session):
             c.setFont("Helvetica", fs)
             c.drawString(MARGEN + 4, y - TBL_ROW_H + 3, nombre)
             c.setFont("Helvetica", 9)
-            c.drawRightString(MARGEN + TBL_TEL_W + TBL_MOD_W - 2, y - TBL_ROW_H + 3, item["modulo"][:6])
-            c.drawRightString(MARGEN + TBL_W - 2, y - TBL_ROW_H + 3, fp(item["total"]))
+            c.drawRightString(X_MOD,  y - TBL_ROW_H + 3, item["modulo"][:6])
+            c.drawRightString(X_TIPO, y - TBL_ROW_H + 3, item["tipo"])
+            c.drawRightString(X_PRC,  y - TBL_ROW_H + 3, fp(item["total"]))
             y -= TBL_ROW_H
     y -= 10
 
