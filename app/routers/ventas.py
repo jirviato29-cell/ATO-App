@@ -574,6 +574,40 @@ def crear_ventas(
             ventas_realizadas.append(nueva)
             continue
 
+        # Misma validacion que crear_ventas_multiples: tipo real segun el catalogo
+        # (inventario_general). Un telefono (ej. tablet) no se vende como accesorio.
+        # Va antes de tocar la base.
+        producto_catalogo = None
+        if item.clave and item.clave.strip():
+            producto_catalogo = (
+                db.query(models.InventarioGeneral)
+                .filter(func.upper(func.trim(models.InventarioGeneral.clave)) == item.clave.strip().upper())
+                .first()
+            )
+        if producto_catalogo is None:
+            producto_catalogo = (
+                db.query(models.InventarioGeneral)
+                .filter(func.upper(func.trim(models.InventarioGeneral.producto)) == item.producto.strip().upper())
+                .first()
+            )
+        # skip_inventario: parte en tarjeta de un pago dividido (segunda peticion);
+        # su parte en efectivo ya paso por esta validacion.
+        if (
+            not item.skip_inventario
+            and producto_catalogo
+            and (producto_catalogo.tipo_producto or "").strip().lower() == "telefono"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{item.producto} es teléfono. Regístralo en la sección de Teléfonos con su IMEI.",
+            )
+        # Tipo segun el catalogo; si no esta en inventario_general, el que mando el frontend (como antes)
+        tipo_producto = (
+            (producto_catalogo.tipo_producto or "accesorios").strip().lower()
+            if producto_catalogo
+            else item.tipo_producto
+        )
+
         com = (
             db.query(models.Comision)
             .filter(func.lower(models.Comision.producto) == item.producto.strip().lower())
@@ -617,7 +651,7 @@ def crear_ventas(
             producto=item.producto,
             cantidad=item.cantidad,
             precio_unitario=item.precio_unitario,
-            tipo_producto=item.tipo_producto,
+            tipo_producto=tipo_producto,
             tipo_venta=item.tipo_venta,
             metodo_pago=venta.metodo_pago,
             total=total,
