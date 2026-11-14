@@ -1,6 +1,6 @@
 import calendar
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -1816,7 +1816,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     # módulo BO (21) ni prueba (20). Los chips no tienen modulo_id propio, se
     # filtran por el modulo del empleado.
     # ─────────────────────────────────────────────────────────────────────────
-    EXCLUIR_NUEVAS = {20, 21}
     TARJETA_SET = {"tarjeta", "terminal"}
 
     # 1) FORMA DE PAGO (solo totales generales) ───────────────────────────────
@@ -1828,7 +1827,7 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         .filter(
             models.Venta.fecha == fecha,
             models.Venta.cancelada.isnot(True),
-            ~models.Venta.modulo_id.in_(EXCLUIR_NUEVAS),
+            ~models.Venta.modulo_id.in_(EXCLUIR_IDS),
         )
         .all()
     )
@@ -1864,7 +1863,8 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     tel_hoy_por_tv = {tv: int(c or 0) for tv, c in tel_hoy_rows}
     dia_tel_contado  = tel_hoy_por_tv.get("contado", 0)
     dia_tel_paguitos = tel_hoy_por_tv.get("paguitos", 0)
-    dia_tel_payjoy   = tel_hoy_por_tv.get("payjoy", 0)
+    # "pajoy" es un typo común que queremos contar también como PayJoy.
+    dia_tel_payjoy   = tel_hoy_por_tv.get("payjoy", 0) + tel_hoy_por_tv.get("pajoy", 0)
     dia_tel_planes   = tel_hoy_por_tv.get("plan", 0)
 
     # Piezas de accesorios vendidas HOY (incluye las regaladas por promoción).
@@ -1879,84 +1879,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
         .scalar()
         or 0
     )
-
-    # 2) COMPARATIVO VS AÑO PASADO (fecha - 364 días, mismo día de la semana) ─
-    fecha_ant = fecha - timedelta(days=364)
-
-    def _totales_dia(f: date):
-        base = (
-            db.query(models.Venta)
-            .filter(
-                models.Venta.fecha == f,
-                models.Venta.cancelada.isnot(True),
-                ~models.Venta.modulo_id.in_(EXCLUIR_NUEVAS),
-            )
-        )
-        acc = float(
-            base.filter(func.lower(models.Venta.tipo_producto) == "accesorios")
-            .with_entities(
-                func.coalesce(func.sum(models.Venta.precio_unitario * models.Venta.cantidad), 0)
-            )
-            .scalar()
-            or 0
-        )
-        tel = float(
-            base.filter(func.lower(models.Venta.tipo_producto) == "telefono")
-            .with_entities(
-                func.coalesce(func.sum(models.Venta.precio_unitario * models.Venta.cantidad), 0)
-            )
-            .scalar()
-            or 0
-        )
-        return acc, tel
-
-    comp_acc_hoy, comp_tel_hoy = _totales_dia(fecha)
-    comp_acc_ant, comp_tel_ant = _totales_dia(fecha_ant)
-    comp_tot_hoy = comp_acc_hoy + comp_tel_hoy
-    comp_tot_ant = comp_acc_ant + comp_tel_ant
-    comp_dif = comp_tot_hoy - comp_tot_ant
-    comp_pct = (comp_dif / comp_tot_ant * 100.0) if comp_tot_ant > 0 else 0.0
-    comp_rebaso = comp_tot_hoy > comp_tot_ant
-
-    # 3) CONTADORES DEL MES (día 1 a la fecha del reporte) ────────────────────
-    primer_dia = fecha.replace(day=1)
-
-    # Teléfonos: tipo_venta IS NOT NULL excluye la parte tarjeta de los pagos
-    # divididos (ver _registrar_renglon_telefono en routers/ventas.py).
-    tel_rows_mes = (
-        db.query(
-            func.lower(func.coalesce(models.Venta.tipo_venta, "")),
-            func.coalesce(func.sum(models.Venta.cantidad), 0),
-        )
-        .filter(
-            models.Venta.fecha >= primer_dia,
-            models.Venta.fecha <= fecha,
-            func.lower(models.Venta.tipo_producto) == "telefono",
-            models.Venta.tipo_venta.isnot(None),
-            models.Venta.cancelada.isnot(True),
-            ~models.Venta.modulo_id.in_(EXCLUIR_NUEVAS),
-        )
-        .group_by(func.lower(func.coalesce(models.Venta.tipo_venta, "")))
-        .all()
-    )
-    tel_por_tipo_venta = {tv: int(c or 0) for tv, c in tel_rows_mes}
-    tel_mes_total = sum(tel_por_tipo_venta.values())
-    tel_mes_contado  = tel_por_tipo_venta.get("contado", 0)
-    tel_mes_paguitos = tel_por_tipo_venta.get("paguitos", 0)
-    tel_mes_payjoy   = tel_por_tipo_venta.get("payjoy", 0)
-
-    planes_mes = (
-        db.query(func.count(models.PlanTarifario.id))
-        .filter(
-            func.date(models.PlanTarifario.fecha) >= primer_dia,
-            func.date(models.PlanTarifario.fecha) <= fecha,
-            or_(
-                models.PlanTarifario.modulo_id.is_(None),
-                ~models.PlanTarifario.modulo_id.in_(EXCLUIR_NUEVAS),
-            ),
-        )
-        .scalar()
-    ) or 0
 
     # ── Generar PDF ───────────────────────────────────────────────────────────
     AZUL     = HexColor("#16264a")
@@ -1998,13 +1920,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
             if acc_vis:
                 content_h += HDR_H + acc_vis * ROW_H
             content_h += SUB_H + 26
-
-    # Alturas de las 2 secciones compactas que se dibujan arriba, entre TOTAL
-    # GENERAL DEL DÍA y VENTAS POR MÓDULO. (Forma de pago ya va fusionada en
-    # la barra amarilla del TOTAL GENERAL DEL DÍA.)
-    COMP_H = HDR_H + (ROW_H * 4) + 10
-    CONT_H = HDR_H + (ROW_H * 5) + 10
-    content_h += COMP_H + CONT_H
 
     H = 82.0 + content_h + MARGEN
 
@@ -2106,99 +2021,6 @@ def _generar_pdf_reporte(fecha: date, db: Session):
     c.setFont("Helvetica-Bold", 13)
     c.drawRightString(CT - 4, y - 20, fp(res_tot))
     y -= BAR_H + 12
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # COMPARATIVO CONTRA EL AÑO PASADO (compacto)
-    # ─────────────────────────────────────────────────────────────────────────
-    hoy_str = fecha.strftime("%d/%m/%Y")
-    ant_str = fecha_ant.strftime("%d/%m/%Y")
-    c.setFillColor(VERDE if comp_rebaso else NARANJA)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(CP, y - 13, f"COMPARATIVO CONTRA EL AÑO PASADO  ({hoy_str} vs {ant_str})")
-    etq = "SE REBASÓ" if comp_rebaso else "NO SE REBASÓ"
-    if comp_tot_ant > 0:
-        signo_pct = "+" if comp_dif >= 0 else "−"
-        pct_txt = f"{signo_pct}{abs(comp_pct):.1f}%"
-    else:
-        pct_txt = "—"
-    c.drawRightString(CT, y - 13, f"{etq}   {pct_txt}")
-    y -= HDR_H
-
-    # columnas
-    col_hoy = MARGEN + 230
-    col_ant = MARGEN + 350
-    col_dif = W - MARGEN - 90
-    col_pct = CT
-    c.setFillColor(GRIS_T)
-    c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-    c.setFillColor(AZUL)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(MARGEN + 6, y - 11, "CONCEPTO")
-    c.drawRightString(col_hoy, y - 11, hoy_str)
-    c.drawRightString(col_ant, y - 11, ant_str)
-    c.drawRightString(col_dif, y - 11, "DIFERENCIA")
-    c.drawRightString(col_pct, y - 11, "%")
-    y -= ROW_H
-
-    def _comp_row(idx: int, lbl: str, hoy_v: float, ant_v: float, es_total: bool = False) -> float:
-        nonlocal y
-        c.setFillColor(GRIS_T if es_total else (GRIS_F if idx % 2 == 0 else white))
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(AZUL if es_total else black)
-        c.setFont("Helvetica-Bold" if es_total else "Helvetica", 10)
-        c.drawString(MARGEN + 6, y - 11, lbl)
-        c.drawRightString(col_hoy, y - 11, fp(hoy_v))
-        c.setFillColor(black)
-        c.setFont("Helvetica" if not es_total else "Helvetica-Bold", 10)
-        c.drawRightString(col_ant, y - 11, fp(ant_v))
-        dif = hoy_v - ant_v
-        c.setFillColor(VERDE if dif >= 0 else NARANJA)
-        c.setFont("Helvetica-Bold", 10)
-        signo = "+" if dif >= 0 else "−"
-        c.drawRightString(col_dif, y - 11, f"{signo}{fp(abs(dif))}")
-        if ant_v > 0:
-            pct = dif / ant_v * 100
-            spct = "+" if dif >= 0 else "−"
-            c.drawRightString(col_pct, y - 11, f"{spct}{abs(pct):.1f}%")
-        else:
-            c.drawRightString(col_pct, y - 11, "—")
-        y -= ROW_H
-        return y
-
-    _comp_row(0, "Accesorios", comp_acc_hoy, comp_acc_ant)
-    _comp_row(1, "Teléfonos",  comp_tel_hoy, comp_tel_ant)
-    _comp_row(2, "TOTAL",      comp_tot_hoy, comp_tot_ant, es_total=True)
-    y -= 10
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # CONTADORES DEL MES (día 1 a la fecha del reporte)
-    # ─────────────────────────────────────────────────────────────────────────
-    c.setFillColor(AZUL)
-    c.rect(MARGEN, y - HDR_H, ancho, HDR_H, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(CP, y - 13, f"CONTADORES DEL MES  ({primer_dia.strftime('%d/%m')} – {fecha.strftime('%d/%m')})")
-    y -= HDR_H
-
-    def _cont_row(idx: int, lbl: str, cant: int, bold: bool = False) -> float:
-        nonlocal y
-        c.setFillColor(GRIS_T if bold else (GRIS_F if idx % 2 == 0 else white))
-        c.rect(MARGEN, y - ROW_H, ancho, ROW_H, fill=1, stroke=0)
-        c.setFillColor(AZUL if bold else black)
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
-        c.drawString(MARGEN + 6, y - 11, lbl)
-        c.drawRightString(CT, y - 11, str(cant))
-        y -= ROW_H
-        return y
-
-    _cont_row(0, "Teléfonos vendidos (total)", tel_mes_total, bold=True)
-    _cont_row(1, "   Contado",  tel_mes_contado)
-    _cont_row(2, "   Paguitos", tel_mes_paguitos)
-    _cont_row(3, "   PayJoy",   tel_mes_payjoy)
-    _cont_row(4, "Planes tarifarios", int(planes_mes), bold=True)
-    y -= 10
 
     # ── VENTAS POR MÓDULO (cuadrícula 5 por fila) ─────────────────────────────
     # Barra de título
