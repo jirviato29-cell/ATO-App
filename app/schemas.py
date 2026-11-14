@@ -207,6 +207,7 @@ class UsuarioUpdate(BaseModel):
     asegurado: Optional[bool] = None
     fecha_ingreso: Optional[date] = None
     whatsapp: Optional[str] = Field(None, max_length=15)
+    talla: Optional[str] = Field(None, max_length=10)
     foto_url: Optional[str] = None
 
 # 👉 Este para devolver la respuesta

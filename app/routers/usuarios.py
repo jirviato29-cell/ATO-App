@@ -49,7 +49,13 @@ def cifrar_contraseña(password: str):
 class UsuarioConIngresoResponse(schemas.UsuarioResponse):
     fecha_ingreso: Optional[date] = None  # pydantic la serializa como "YYYY-MM-DD"
     whatsapp: Optional[str] = None
+    talla: Optional[str] = None
     foto_url: Optional[str] = None
+
+
+def _texto_limpio(valor: Optional[str]) -> Optional[str]:
+    """Quita espacios; vacío -> None."""
+    return (valor or "").strip() or None
 
 
 # ------------------- REGISTRO -------------------
@@ -523,14 +529,14 @@ def editar_usuario(
         if "forma_pago" in datos.model_fields_set:
             usuario_db.forma_pago = datos.forma_pago or None
         if "cuenta_clabe" in datos.model_fields_set:
-            usuario_db.cuenta_clabe = datos.cuenta_clabe or None
+            usuario_db.cuenta_clabe = _texto_limpio(datos.cuenta_clabe)
         if "tienda_id" in datos.model_fields_set:
             _validar_tienda(db, datos.tienda_id)
             usuario_db.tienda_id = datos.tienda_id
         if "asegurado" in datos.model_fields_set:
             usuario_db.asegurado = bool(datos.asegurado)
         if "cuenta_interbancaria" in datos.model_fields_set:
-            usuario_db.cuenta_interbancaria = datos.cuenta_interbancaria or None
+            usuario_db.cuenta_interbancaria = _texto_limpio(datos.cuenta_interbancaria)
         if "nombre_englobado" in datos.model_fields_set:
             usuario_db.nombre_englobado = datos.nombre_englobado or None
         if datos.jornada_fija is not None:
@@ -538,7 +544,9 @@ def editar_usuario(
         if "fecha_ingreso" in datos.model_fields_set:
             usuario_db.fecha_ingreso = datos.fecha_ingreso
         if "whatsapp" in datos.model_fields_set:
-            usuario_db.whatsapp = datos.whatsapp or None
+            usuario_db.whatsapp = _texto_limpio(datos.whatsapp)
+        if "talla" in datos.model_fields_set:
+            usuario_db.talla = _texto_limpio(datos.talla)
         if "foto_url" in datos.model_fields_set:
             usuario_db.foto_url = datos.foto_url or None
 
