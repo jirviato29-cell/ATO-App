@@ -1,11 +1,11 @@
 import math
 import unicodedata
-from typing import Dict, Iterable, List, Literal, Optional
+from typing import Annotated, Dict, Iterable, List, Literal, Optional, Union
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -49,12 +49,31 @@ class VacacionResponse(BaseModel):
 class SolicitudResponse(VacacionResponse):
     nombre_completo: Optional[str] = None
     modulos: List[str] = []
-    # Saldo del ciclo vigente (aniversario a aniversario); null sin fecha_ingreso
+    # Saldo del año de vacaciones donde cae fecha_inicio (aniversario a aniversario);
+    # null sin fecha_ingreso
     dias_corresponden: Optional[int] = None
     ciclo_inicio: Optional[date] = None
     ciclo_fin: Optional[date] = None
     dias_usados: Optional[float] = None
+    dias_solicitados_pendientes: Optional[float] = None
     dias_quedan: Optional[float] = None
+
+
+class SaldoAnio(BaseModel):
+    anios: int
+    dias_corresponden: int
+    ciclo_inicio: date
+    ciclo_fin: date
+    dias_usados: float
+    dias_solicitados_pendientes: float
+    dias_quedan: float
+
+
+class SaldoResponse(BaseModel):
+    clave: str
+    # null si la persona no tiene fecha de ingreso
+    actual: Optional[SaldoAnio] = None
+    siguiente: Optional[SaldoAnio] = None
 
 
 class VacacionCrear(BaseModel):
@@ -64,6 +83,20 @@ class VacacionCrear(BaseModel):
     dias: float = Field(..., gt=0, le=999.9)
     tipo: Literal["vacaciones", "falta_injustificada"]
     nota: Optional[str] = None
+
+
+class DescuentoCrear(BaseModel):
+    # La fecha la calcula el servidor: si mandan fechas u otro campo, se rechaza (422)
+    model_config = ConfigDict(extra="forbid")
+
+    tipo: Literal["descuento"]
+    clave: str = Field(..., min_length=1, max_length=50)
+    anio: Literal["actual", "siguiente"]
+    dias: float = Field(..., gt=0, le=999.9)
+    nota: str = Field(..., min_length=1, max_length=500)
+
+
+CrearBody = Annotated[Union[VacacionCrear, DescuentoCrear], Field(discriminator="tipo")]
 
 
 class AprobacionBody(BaseModel):
@@ -191,14 +224,14 @@ def listar_solicitudes(
         .all()
     )
     nombre_por_clave = {f.clave: f.nombre_completo for f in filas}
-    saldos = _saldos_vacaciones(db, claves)
+    saldos = _saldos_solicitudes(db, vacaciones)
 
     nombres = _nombres_aprobadores(db, vacaciones)
     return [
         {
             **_serializar(v, nombres),
             "nombre_completo": nombre_por_clave.get(_normalizar(v.clave)),
-            **saldos.get(_normalizar(v.clave), _SALDO_VACIO),
+            **saldos.get(v.id, _SALDO_VACIO),
         }
         for v in vacaciones
     ]
@@ -213,6 +246,7 @@ _SALDO_VACIO = {
     "ciclo_inicio": None,
     "ciclo_fin": None,
     "dias_usados": None,
+    "dias_solicitados_pendientes": None,
     "dias_quedan": None,
 }
 
@@ -252,101 +286,304 @@ def _solo_fin_de_semana(horario) -> bool:
     return bool(trabajados) and trabajados <= {"sabado", "domingo"}
 
 
-def _saldos_vacaciones(db: Session, claves: Iterable[str]) -> Dict[str, dict]:
+def _cuentas_por_clave(db: Session, claves: Iterable[str]) -> Dict[str, List[models.Usuario]]:
+    # Misma regla que Mis datos / Mi Perfil: cuentas activas de empleado con ese
+    # nombre_englobado (si no tiene ninguna de empleado, sus cuentas activas).
     claves = {c for c in claves if c}
     if not claves:
         return {}
-    hoy = datetime.now(ZONA_MX).date()
-
-    # Misma regla que Mis datos / Mi Perfil: cuentas activas de empleado con ese
-    # nombre_englobado; la principal es la primera (por id) con sueldo > 0.
-    cuentas_por_clave: Dict[str, List[models.Usuario]] = {}
+    todas: Dict[str, List[models.Usuario]] = {}
     for u in (
         db.query(models.Usuario)
         .filter(
             _clave_columna(models.Usuario.nombre_englobado).in_(claves),
             models.Usuario.activo == True,
-            models.Usuario.rol.in_(ROLES_EMPLEADO),
         )
         .order_by(models.Usuario.id)
         .all()
     ):
-        cuentas_por_clave.setdefault(_normalizar(u.nombre_englobado), []).append(u)
+        todas.setdefault(_normalizar(u.nombre_englobado), []).append(u)
+    return {
+        clave: [c for c in cuentas if c.rol in ROLES_EMPLEADO] or cuentas
+        for clave, cuentas in todas.items()
+    }
 
-    aprobadas: Dict[str, List[models.Vacacion]] = {}
+
+def _periodos_saldo(db: Session, claves: Iterable[str]) -> Dict[str, List[models.Vacacion]]:
+    # Lo que cuenta para el saldo: vacaciones (el estado se revisa despues) y descuentos
+    claves = {c for c in claves if c}
+    if not claves:
+        return {}
+    periodos: Dict[str, List[models.Vacacion]] = {}
     for v in (
         db.query(models.Vacacion)
         .filter(
             _clave_columna(models.Vacacion.clave).in_(claves),
-            models.Vacacion.tipo == "vacaciones",
-            func.lower(func.trim(models.Vacacion.estado)).in_(("autorizada", "tomada")),
+            models.Vacacion.tipo.in_(("vacaciones", "descuento")),
         )
         .all()
     ):
-        aprobadas.setdefault(_normalizar(v.clave), []).append(v)
+        periodos.setdefault(_normalizar(v.clave), []).append(v)
+    return periodos
 
-    saldos: Dict[str, dict] = {}
-    for clave, cuentas in cuentas_por_clave.items():
+
+def _principal(cuentas: List[models.Usuario]) -> Optional[models.Usuario]:
+    # La principal es la primera (por id) con sueldo > 0; si ninguna, la primera
+    if not cuentas:
+        return None
+    return next((c for c in cuentas if (c.sueldo_base or 0) > 0), cuentas[0])
+
+
+def _calcular_saldo(
+    principal: Optional[models.Usuario], periodos: List[models.Vacacion], fecha: date
+) -> Optional[dict]:
+    """Saldo del año de vacaciones donde cae `fecha`. None si no hay fecha de ingreso.
+
+    usados = vacaciones autorizadas/tomadas + descuentos, con fecha_inicio dentro del año.
+    pendientes = vacaciones en 'solicitada' dentro del año (no se restan de quedan).
+    Antes de la fecha de ingreso cuenta como año 0 (le tocan 0).
+    """
+    ingreso = principal.fecha_ingreso if principal else None
+    if not ingreso:
+        return None
+    anios = max(0, fecha.year - ingreso.year - (1 if _aniversario(ingreso, fecha.year) > fecha else 0))
+    ciclo_inicio = _aniversario(ingreso, ingreso.year + anios)
+    ciclo_fin = _aniversario(ingreso, ingreso.year + anios + 1) - timedelta(days=1)
+    corresponden = _dias_lft(anios)
+    if _solo_fin_de_semana(principal.horario_semanal):
+        corresponden = math.ceil(corresponden / 3)
+
+    usados = pendientes = 0.0
+    for v in periodos:
+        if not (ciclo_inicio <= v.fecha_inicio <= ciclo_fin):
+            continue
+        estado = (v.estado or "").strip().lower()
+        if v.tipo == "descuento" or (v.tipo == "vacaciones" and estado in ("autorizada", "tomada")):
+            usados += float(v.dias or 0)
+        elif v.tipo == "vacaciones" and estado == "solicitada":
+            pendientes += float(v.dias or 0)
+    return {
+        "anios": anios,
+        "dias_corresponden": corresponden,
+        "ciclo_inicio": ciclo_inicio,
+        "ciclo_fin": ciclo_fin,
+        "dias_usados": usados,
+        "dias_solicitados_pendientes": pendientes,
+        "dias_quedan": corresponden - usados,
+    }
+
+
+def saldo_vacaciones(db: Session, clave: str, fecha: date) -> Optional[dict]:
+    """Funcion unica de saldo por (clave, fecha)."""
+    clave_norm = _normalizar(clave)
+    principal = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
+    return _calcular_saldo(principal, _periodos_saldo(db, [clave_norm]).get(clave_norm, []), fecha)
+
+
+def saldo_actual_y_siguiente(db: Session, clave: str) -> dict:
+    clave_norm = _normalizar(clave)
+    hoy = datetime.now(ZONA_MX).date()
+    actual = saldo_vacaciones(db, clave_norm, hoy)
+    siguiente = (
+        saldo_vacaciones(db, clave_norm, actual["ciclo_fin"] + timedelta(days=1)) if actual else None
+    )
+    return {"clave": clave_norm, "actual": actual, "siguiente": siguiente}
+
+
+def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[int, dict]:
+    # Por solicitud: modulos de la persona y saldo del año donde cae su fecha_inicio
+    claves = {_normalizar(v.clave) for v in vacaciones}
+    cuentas = _cuentas_por_clave(db, claves)
+    periodos = _periodos_saldo(db, claves)
+    resultado: Dict[int, dict] = {}
+    for v in vacaciones:
+        clave = _normalizar(v.clave)
+        if clave not in cuentas:
+            resultado[v.id] = _SALDO_VACIO
+            continue
         modulos: List[str] = []
-        for c in cuentas:
+        for c in cuentas[clave]:
             if c.modulo and c.modulo.nombre and c.modulo.nombre not in modulos:
                 modulos.append(c.modulo.nombre)
-        saldo = {**_SALDO_VACIO, "modulos": modulos}
+        saldo = _calcular_saldo(_principal(cuentas[clave]), periodos.get(clave, []), v.fecha_inicio)
+        datos = {**_SALDO_VACIO, "modulos": modulos}
+        if saldo:
+            datos.update({k: saldo[k] for k in _SALDO_VACIO if k in saldo})
+        resultado[v.id] = datos
+    return resultado
 
-        principal = next((c for c in cuentas if (c.sueldo_base or 0) > 0), cuentas[0])
-        ingreso = principal.fecha_ingreso
-        if ingreso and ingreso <= hoy:
-            anios = hoy.year - ingreso.year - (1 if _aniversario(ingreso, hoy.year) > hoy else 0)
-            ciclo_inicio = _aniversario(ingreso, ingreso.year + anios)
-            ciclo_fin = _aniversario(ingreso, ingreso.year + anios + 1) - timedelta(days=1)
-            corresponden = _dias_lft(anios)
-            if _solo_fin_de_semana(principal.horario_semanal):
-                corresponden = math.ceil(corresponden / 3)
-            usados = sum(
-                float(v.dias or 0)
-                for v in aprobadas.get(clave, [])
-                if ciclo_inicio <= v.fecha_inicio <= ciclo_fin
+
+# ------------------- Reglas de periodos (admin y Mi Perfil) -------------------
+MAX_DIAS_SEGUIDOS = 6
+DIAS_ENTRE_PERIODOS = 15
+# Periodos que ya cuentan para "uno por mes" y para la separacion de 15 dias
+ESTADOS_VIGENTES = ("solicitada", "autorizada", "tomada")
+# Ni las faltas ni los descuentos son periodos de vacaciones
+TIPOS_SIN_REGLAS = ("falta_injustificada", "descuento")
+
+MESES = (
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+)
+
+
+def _texto_fecha(d: date) -> str:
+    return f"{d.day} de {MESES[d.month - 1]} de {d.year}"
+
+
+def _numero(n: float) -> str:
+    return f"{n:g}"
+
+
+def _dia_bloqueado(d: date) -> bool:
+    # Ventas navideñas (7 dic - 7 ene) y Buen Fin (13 - 16 nov), cualquier año
+    return (
+        (d.month == 12 and d.day >= 7)
+        or (d.month == 1 and d.day <= 7)
+        or (d.month == 11 and 13 <= d.day <= 16)
+    )
+
+
+def _meses(inicio: date, fin: date) -> set:
+    # Un periodo ocupa el mes donde empieza y el mes donde termina
+    return {(inicio.year, inicio.month), (fin.year, fin.month)}
+
+
+def validar_fechas_vacaciones(inicio: date, fin: date, tu: bool) -> None:
+    """Maximo de dias seguidos y dias bloqueados. `tu`: mensajes para la propia persona."""
+    if (fin - inicio).days + 1 > MAX_DIAS_SEGUIDOS:
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días seguidos por periodo")
+    for n in range((fin - inicio).days + 1):
+        d = inicio + timedelta(days=n)
+        if _dia_bloqueado(d):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"El {_texto_fecha(d)} está en periodo de ventas (7 dic - 7 ene o 13 - 16 nov): "
+                    f"no se pueden {'pedir' if tu else 'registrar'} vacaciones"
+                ),
             )
-            saldo.update(
-                dias_corresponden=corresponden,
-                ciclo_inicio=ciclo_inicio,
-                ciclo_fin=ciclo_fin,
-                dias_usados=usados,
-                dias_quedan=corresponden - usados,
+
+
+def validar_contra_periodos(existentes: List[models.Vacacion], inicio: date, fin: date, tu: bool) -> None:
+    """Uno por mes y 15 dias entre periodos, contra los periodos ya guardados (no rechazados)."""
+    vigentes = [
+        v for v in existentes
+        if (v.estado or "").strip().lower() in ESTADOS_VIGENTES and v.tipo not in TIPOS_SIN_REGLAS
+    ]
+    meses_nuevos = _meses(inicio, fin)
+    for v in vigentes:
+        if meses_nuevos & _meses(v.fecha_inicio, v.fecha_fin):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Solo se permite un periodo de vacaciones por mes: ya {'tienes' if tu else 'tiene'} el del "
+                    f"{_texto_fecha(v.fecha_inicio)} al {_texto_fecha(v.fecha_fin)}"
+                ),
             )
-        saldos[clave] = saldo
-    return saldos
+    for v in vigentes:
+        separado = (
+            inicio > v.fecha_fin + timedelta(days=DIAS_ENTRE_PERIODOS)
+            or fin < v.fecha_inicio - timedelta(days=DIAS_ENTRE_PERIODOS)
+        )
+        if not separado:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Debe haber al menos {DIAS_ENTRE_PERIODOS} días libres entre un periodo y otro: "
+                    f"{'tienes' if tu else 'tiene'} uno del {_texto_fecha(v.fecha_inicio)} al {_texto_fecha(v.fecha_fin)}"
+                ),
+            )
+
+
+def validar_saldo(db: Session, clave: str, inicio: date, dias: float, tu: bool) -> None:
+    """Sin adelantos: se valida contra el año de vacaciones donde cae fecha_inicio.
+    Llamar despues del candado de la persona (cuenta las solicitudes pendientes)."""
+    saldo = saldo_vacaciones(db, clave, inicio)
+    if saldo is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {'tienes' if tu else 'tiene'} fecha de ingreso; pide a RH que la registre",
+        )
+    if saldo["anios"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Aún no cumples tu primer año" if tu else "Aún no cumple su primer año",
+        )
+    disponibles = saldo["dias_quedan"] - saldo["dias_solicitados_pendientes"]
+    if dias > disponibles:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Solo {'te' if tu else 'le'} quedan {_numero(max(disponibles, 0))} días "
+                f"en el año de vacaciones del {_texto_fecha(saldo['ciclo_inicio'])} "
+                f"al {_texto_fecha(saldo['ciclo_fin'])}"
+            ),
+        )
+
+
+def candado_persona(db: Session, clave_norm: str) -> None:
+    # Serializa las altas de una misma persona hasta el commit; sin esto, un
+    # doble envio pasaria las validaciones dos veces.
+    db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"vacaciones:{clave_norm}"))))
+
+
+def periodos_guardados(db: Session, clave_norm: str) -> List[models.Vacacion]:
+    return (
+        db.query(models.Vacacion)
+        .filter(
+            _clave_columna(models.Vacacion.clave) == clave_norm,
+            models.Vacacion.estado.is_distinct_from("rechazada"),
+        )
+        .order_by(models.Vacacion.fecha_inicio)
+        .all()
+    )
+
+
+@router.get("/saldo", response_model=SaldoResponse)
+def ver_saldo(
+    clave: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    return saldo_actual_y_siguiente(db, clave)
 
 
 @router.post("", response_model=VacacionResponse, status_code=201)
 @router.post("/", response_model=VacacionResponse, status_code=201, include_in_schema=False)
 def crear_vacacion(
-    body: VacacionCrear,
+    body: CrearBody,
     db: Session = Depends(get_db),
     admin: models.Usuario = Depends(solo_admin),
 ):
-    if body.fecha_fin < body.fecha_inicio:
-        raise HTTPException(status_code=400, detail="fecha_fin no puede ser anterior a fecha_inicio")
-
     usuario = _usuario_activo(db, body.clave)
     if usuario is None:
         raise HTTPException(status_code=400, detail="La clave no corresponde a un usuario activo")
-
     clave_norm = _normalizar(body.clave)
-    # Serializa las altas de una misma persona hasta el commit; sin esto, un
-    # doble envio pasaria el chequeo de empalme dos veces.
-    db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"vacaciones:{clave_norm}"))))
 
-    empalme = (
-        db.query(models.Vacacion)
-        .filter(
-            _clave_columna(models.Vacacion.clave) == clave_norm,
-            models.Vacacion.estado.is_distinct_from("rechazada"),
-            models.Vacacion.fecha_inicio <= body.fecha_fin,
-            models.Vacacion.fecha_fin >= body.fecha_inicio,
-        )
-        .order_by(models.Vacacion.fecha_inicio)
-        .first()
+    if isinstance(body, DescuentoCrear):
+        return _crear_descuento(db, body, usuario, admin)
+
+    if body.fecha_fin < body.fecha_inicio:
+        raise HTTPException(status_code=400, detail="fecha_fin no puede ser anterior a fecha_inicio")
+
+    # Admin no tiene la regla de anticipacion (puede capturar fechas cercanas o
+    # pasadas), pero si: maximo de dias, bloqueos, uno por mes, 15 dias y saldo.
+    # Las faltas injustificadas siguen sin reglas.
+    es_vacacion = body.tipo == "vacaciones"
+    if es_vacacion:
+        validar_fechas_vacaciones(body.fecha_inicio, body.fecha_fin, tu=False)
+
+    candado_persona(db, clave_norm)
+    existentes = periodos_guardados(db, clave_norm)
+
+    # Los descuentos son una fila fechada en el aniversario: no son un periodo y no empalman
+    empalme = next(
+        (
+            v for v in existentes
+            if v.tipo != "descuento" and v.fecha_inicio <= body.fecha_fin and v.fecha_fin >= body.fecha_inicio
+        ),
+        None,
     )
     if empalme is not None:
         raise HTTPException(
@@ -357,15 +594,56 @@ def crear_vacacion(
             ),
         )
 
+    if es_vacacion:
+        validar_contra_periodos(existentes, body.fecha_inicio, body.fecha_fin, tu=False)
+        validar_saldo(db, clave_norm, body.fecha_inicio, body.dias, tu=False)
+
+    if not es_vacacion:
+        estado = "autorizada"
+    elif body.fecha_fin < datetime.now(ZONA_MX).date():
+        # Vacaciones que ya pasaron: se capturan como tomadas
+        estado = "tomada"
+    else:
+        estado = "solicitada"
+
     vacacion = models.Vacacion(
         clave=usuario.nombre_englobado.strip(),
         fecha_inicio=body.fecha_inicio,
         fecha_fin=body.fecha_fin,
         dias=body.dias,
         tipo=body.tipo,
-        estado="solicitada" if body.tipo == "vacaciones" else "autorizada",
+        estado=estado,
         origen="sistema",
         nota=body.nota,
+        creado_por=admin.id,
+        creado_at=datetime.now(timezone.utc),
+    )
+    db.add(vacacion)
+    db.commit()
+    db.refresh(vacacion)
+    return _serializar(vacacion, {})
+
+
+def _crear_descuento(db: Session, body: DescuentoCrear, usuario: models.Usuario, admin: models.Usuario):
+    nota = body.nota.strip()
+    if not nota:
+        raise HTTPException(status_code=400, detail="El motivo del descuento es obligatorio")
+
+    # Un descuento es una fila fechada en el primer dia (aniversario) del año al que se descuenta
+    saldo = saldo_actual_y_siguiente(db, body.clave)[body.anio]
+    if saldo is None:
+        raise HTTPException(status_code=400, detail="No tiene fecha de ingreso; pide a RH que la registre")
+    fecha = saldo["ciclo_inicio"]
+
+    vacacion = models.Vacacion(
+        clave=usuario.nombre_englobado.strip(),
+        fecha_inicio=fecha,
+        fecha_fin=fecha,
+        dias=body.dias,
+        tipo="descuento",
+        estado="autorizada",
+        origen="ajuste",
+        nota=nota,
         creado_por=admin.id,
         creado_at=datetime.now(timezone.utc),
     )
@@ -431,8 +709,9 @@ def eliminar_vacacion(
     _admin: models.Usuario = Depends(solo_admin),
 ):
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
-    if vacacion.origen != "sistema":
-        raise HTTPException(status_code=409, detail="Solo se borran registros con origen sistema")
+    # sistema = capturado por admin; ajuste = descuento de dias
+    if vacacion.origen not in ("sistema", "ajuste"):
+        raise HTTPException(status_code=409, detail="Solo se borran registros con origen sistema o ajuste")
 
     db.delete(vacacion)
     db.commit()

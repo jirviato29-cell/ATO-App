@@ -1,10 +1,8 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -12,12 +10,21 @@ from app.config import get_current_user
 from app.database import get_db
 from app.routers.vacaciones import (
     NIVELES,
+    ZONA_MX,
+    SaldoResponse,
     VacacionResponse,
     _clave_columna,
     _nombres_aprobadores,
     _normalizar,
     _serializar,
+    _texto_fecha,
     _usuario_activo,
+    candado_persona,
+    periodos_guardados,
+    saldo_actual_y_siguiente,
+    validar_contra_periodos,
+    validar_fechas_vacaciones,
+    validar_saldo,
 )
 
 router = APIRouter()
@@ -115,22 +122,26 @@ def mis_vacaciones(
     return [_serializar(v, nombres) for v in vacaciones]
 
 
+@router.get("/vacaciones/saldo", response_model=SaldoResponse)
+def mi_saldo(
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(get_current_user),
+):
+    # Saldo del año de vacaciones actual y del siguiente; sin englobado no hay saldo
+    englobado = _normalizar(usuario.nombre_englobado)
+    if not englobado:
+        return {"clave": _clave_de(usuario), "actual": None, "siguiente": None}
+    return saldo_actual_y_siguiente(db, englobado)
+
+
 # ------------------- Solicitudes de vacaciones (piloto) -------------------
 # Por ahora solo los usernames de esta lista pueden pedir o cancelar vacaciones.
 PILOTO_MI_PERFIL = ("A55BO-EVELYN",)
 
-ZONA_MX = ZoneInfo("America/Mexico_City")
-# Igual que el calendario del frontend: primer dia elegible = hoy (Mexico) + 31
+# Igual que el calendario del frontend: primer dia elegible = hoy (Mexico) + 31.
+# Las demas reglas (maximo de dias, bloqueos, uno por mes, 15 dias, saldo) son las
+# mismas que POST /vacaciones de admin y viven en app/routers/vacaciones.py.
 DIAS_ANTICIPACION = 31
-MAX_DIAS_SEGUIDOS = 6
-DIAS_ENTRE_PERIODOS = 15
-# Periodos que ya cuentan para "uno por mes" y para la separacion de 15 dias
-ESTADOS_VIGENTES = ("solicitada", "autorizada", "tomada")
-
-MESES = (
-    "enero", "febrero", "marzo", "abril", "mayo", "junio",
-    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-)
 
 
 class SolicitudVacacion(BaseModel):
@@ -153,24 +164,6 @@ def _es_piloto(usuario: models.Usuario) -> bool:
 def _exigir_piloto(usuario: models.Usuario) -> None:
     if not _es_piloto(usuario):
         raise HTTPException(status_code=403, detail="Esta función todavía no está disponible para tu usuario")
-
-
-def _texto_fecha(d: date) -> str:
-    return f"{d.day} de {MESES[d.month - 1]} de {d.year}"
-
-
-def _dia_bloqueado(d: date) -> bool:
-    # Ventas navideñas (7 dic - 7 ene) y Buen Fin (13 - 16 nov), cualquier año
-    return (
-        (d.month == 12 and d.day >= 7)
-        or (d.month == 1 and d.day <= 7)
-        or (d.month == 11 and 13 <= d.day <= 16)
-    )
-
-
-def _meses(inicio: date, fin: date) -> set:
-    # Un periodo ocupa el mes donde empieza y el mes donde termina
-    return {(inicio.year, inicio.month), (fin.year, fin.month)}
 
 
 @router.post("/vacaciones", response_model=VacacionResponse, status_code=201)
@@ -196,9 +189,6 @@ def pedir_vacaciones(
             status_code=400,
             detail=f"Los días no coinciden con las fechas: del {_texto_fecha(inicio)} al {_texto_fecha(fin)} son {dias}",
         )
-    if dias > MAX_DIAS_SEGUIDOS:
-        raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días seguidos por periodo")
-
     hoy = datetime.now(ZONA_MX).date()
     primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION)
     if inicio < primer_dia:
@@ -210,16 +200,7 @@ def pedir_vacaciones(
             ),
         )
 
-    for n in range(dias):
-        d = inicio + timedelta(days=n)
-        if _dia_bloqueado(d):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"El {_texto_fecha(d)} está en periodo de ventas (7 dic - 7 ene o 13 - 16 nov): "
-                    "no se pueden pedir vacaciones"
-                ),
-            )
+    validar_fechas_vacaciones(inicio, fin, tu=True)
 
     cubre = None
     if (body.cubre_clave or "").strip():
@@ -229,22 +210,13 @@ def pedir_vacaciones(
         if _normalizar(cubre.nombre_englobado) == clave_norm:
             raise HTTPException(status_code=400, detail="No puedes cubrirte a ti misma(o)")
 
-    # Serializa las solicitudes de una misma persona hasta el commit (mismo candado
-    # que POST /vacaciones): sin esto, un doble envio pasaria las validaciones dos veces.
-    db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"vacaciones:{clave_norm}"))))
+    # Mismo candado que POST /vacaciones: sin esto, un doble envio pasaria las validaciones dos veces.
+    candado_persona(db, clave_norm)
+    existentes = periodos_guardados(db, clave_norm)
 
-    existentes = (
-        db.query(models.Vacacion)
-        .filter(
-            _clave_columna(models.Vacacion.clave) == clave_norm,
-            models.Vacacion.estado.is_distinct_from("rechazada"),
-        )
-        .order_by(models.Vacacion.fecha_inicio)
-        .all()
-    )
-
+    # Los descuentos son una fila fechada en el aniversario: no son un periodo y no se enciman
     for v in existentes:
-        if v.fecha_inicio <= fin and v.fecha_fin >= inicio:
+        if v.tipo != "descuento" and v.fecha_inicio <= fin and v.fecha_fin >= inicio:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -253,36 +225,9 @@ def pedir_vacaciones(
                 ),
             )
 
-    # Las faltas injustificadas no cuentan como periodo de vacaciones
-    vigentes = [
-        v for v in existentes
-        if (v.estado or "").strip().lower() in ESTADOS_VIGENTES and v.tipo != "falta_injustificada"
-    ]
-
-    meses_nuevos = _meses(inicio, fin)
-    for v in vigentes:
-        if meses_nuevos & _meses(v.fecha_inicio, v.fecha_fin):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Solo se permite un periodo de vacaciones por mes: ya tienes el del "
-                    f"{_texto_fecha(v.fecha_inicio)} al {_texto_fecha(v.fecha_fin)}"
-                ),
-            )
-
-    for v in vigentes:
-        separado = (
-            inicio > v.fecha_fin + timedelta(days=DIAS_ENTRE_PERIODOS)
-            or fin < v.fecha_inicio - timedelta(days=DIAS_ENTRE_PERIODOS)
-        )
-        if not separado:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Debe haber al menos {DIAS_ENTRE_PERIODOS} días libres entre un periodo y otro: "
-                    f"tienes uno del {_texto_fecha(v.fecha_inicio)} al {_texto_fecha(v.fecha_fin)}"
-                ),
-            )
+    validar_contra_periodos(existentes, inicio, fin, tu=True)
+    # Sin adelantos: contra el año de vacaciones donde cae fecha_inicio
+    validar_saldo(db, clave_norm, inicio, dias, tu=True)
 
     nota = (body.nota or "").strip() or None
     vacacion = models.Vacacion(
