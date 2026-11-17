@@ -120,7 +120,8 @@ def mis_vacaciones(
 PILOTO_MI_PERFIL = ("A55BO-EVELYN",)
 
 ZONA_MX = ZoneInfo("America/Mexico_City")
-DIAS_ANTICIPACION = 30
+# Igual que el calendario del frontend: primer dia elegible = hoy (Mexico) + 31
+DIAS_ANTICIPACION = 31
 MAX_DIAS_SEGUIDOS = 6
 DIAS_ENTRE_PERIODOS = 15
 # Periodos que ya cuentan para "uno por mes" y para la separacion de 15 dias
@@ -138,7 +139,10 @@ class SolicitudVacacion(BaseModel):
 
     fecha_inicio: date
     fecha_fin: date
-    cubre_clave: str = Field(..., min_length=1, max_length=50)
+    # Opcional: el servidor lo calcula; si viene y no coincide, se rechaza
+    dias: Optional[int] = None
+    # Opcional: si no lo pone la persona, admin lo asigna con PATCH /vacaciones/{id}/cubre
+    cubre_clave: Optional[str] = Field(None, max_length=50)
     nota: Optional[str] = Field(None, max_length=500)
 
 
@@ -187,6 +191,11 @@ def pedir_vacaciones(
         raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
 
     dias = (fin - inicio).days + 1
+    if body.dias is not None and body.dias != dias:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Los días no coinciden con las fechas: del {_texto_fecha(inicio)} al {_texto_fecha(fin)} son {dias}",
+        )
     if dias > MAX_DIAS_SEGUIDOS:
         raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días seguidos por periodo")
 
@@ -212,11 +221,13 @@ def pedir_vacaciones(
                 ),
             )
 
-    cubre = _usuario_activo(db, body.cubre_clave)
-    if cubre is None:
-        raise HTTPException(status_code=400, detail="La persona que cubre no corresponde a un usuario activo")
-    if _normalizar(cubre.nombre_englobado) == clave_norm:
-        raise HTTPException(status_code=400, detail="No puedes cubrirte a ti misma(o)")
+    cubre = None
+    if (body.cubre_clave or "").strip():
+        cubre = _usuario_activo(db, body.cubre_clave)
+        if cubre is None:
+            raise HTTPException(status_code=400, detail="La persona que cubre no corresponde a un usuario activo")
+        if _normalizar(cubre.nombre_englobado) == clave_norm:
+            raise HTTPException(status_code=400, detail="No puedes cubrirte a ti misma(o)")
 
     # Serializa las solicitudes de una misma persona hasta el commit (mismo candado
     # que POST /vacaciones): sin esto, un doble envio pasaria las validaciones dos veces.
@@ -235,7 +246,7 @@ def pedir_vacaciones(
     for v in existentes:
         if v.fecha_inicio <= fin and v.fecha_fin >= inicio:
             raise HTTPException(
-                status_code=400,
+                status_code=409,
                 detail=(
                     f"Se encima con tu periodo del {_texto_fecha(v.fecha_inicio)} "
                     f"al {_texto_fecha(v.fecha_fin)} ({v.estado})"
@@ -285,7 +296,7 @@ def pedir_vacaciones(
         nota=nota,
         creado_por=usuario.id,
         creado_at=datetime.now(timezone.utc),
-        cubre_clave=cubre.nombre_englobado.strip(),
+        cubre_clave=cubre.nombre_englobado.strip() if cubre else None,
     )
     db.add(vacacion)
     db.commit()
