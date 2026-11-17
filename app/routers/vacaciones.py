@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app import models
 from app.database import get_db
@@ -74,6 +74,38 @@ class SaldoResponse(BaseModel):
     # null si la persona no tiene fecha de ingreso
     actual: Optional[SaldoAnio] = None
     siguiente: Optional[SaldoAnio] = None
+
+
+class CicloPanel(BaseModel):
+    estado: Literal["Cerrado", "Actual", "Siguiente"]
+    ciclo_inicio: date
+    ciclo_fin: date
+    anios: int
+    dias_corresponden: int
+    dias_tomados: float
+    dias_descuentos: float
+    dias_solicitados_pendientes: float
+    dias_quedan: float
+    # Solo ciclos cerrados: lo que no se uso se pierde (no se acumula)
+    dias_perdidos: Optional[float] = None
+
+
+class PersonaPanel(BaseModel):
+    clave: str
+    nombre_completo: Optional[str] = None
+    modulos: List[str] = []
+    fecha_ingreso: Optional[date] = None
+    # Todo lo de abajo es null sin fecha de ingreso
+    anios: Optional[int] = None
+    dias_para_aniversario: Optional[int] = None
+    dias_corresponden: Optional[int] = None
+    dias_tomados: Optional[float] = None
+    dias_descuentos: Optional[float] = None
+    dias_solicitados_pendientes: Optional[float] = None
+    dias_quedan: Optional[float] = None
+    ciclo_inicio: Optional[date] = None
+    ciclo_fin: Optional[date] = None
+    ciclos: List[CicloPanel] = []
 
 
 class VacacionCrear(BaseModel):
@@ -353,20 +385,26 @@ def _calcular_saldo(
     if _solo_fin_de_semana(principal.horario_semanal):
         corresponden = math.ceil(corresponden / 3)
 
-    usados = pendientes = 0.0
+    tomados = descuentos = pendientes = 0.0
     for v in periodos:
+        # Cada periodo cuenta en el año donde empieza
         if not (ciclo_inicio <= v.fecha_inicio <= ciclo_fin):
             continue
         estado = (v.estado or "").strip().lower()
-        if v.tipo == "descuento" or (v.tipo == "vacaciones" and estado in ("autorizada", "tomada")):
-            usados += float(v.dias or 0)
+        if v.tipo == "descuento":
+            descuentos += float(v.dias or 0)
+        elif v.tipo == "vacaciones" and estado in ("autorizada", "tomada"):
+            tomados += float(v.dias or 0)
         elif v.tipo == "vacaciones" and estado == "solicitada":
             pendientes += float(v.dias or 0)
+    usados = tomados + descuentos
     return {
         "anios": anios,
         "dias_corresponden": corresponden,
         "ciclo_inicio": ciclo_inicio,
         "ciclo_fin": ciclo_fin,
+        "dias_tomados": tomados,
+        "dias_descuentos": descuentos,
         "dias_usados": usados,
         "dias_solicitados_pendientes": pendientes,
         "dias_quedan": corresponden - usados,
@@ -411,6 +449,82 @@ def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[
             datos.update({k: saldo[k] for k in _SALDO_VACIO if k in saldo})
         resultado[v.id] = datos
     return resultado
+
+
+def _ciclos_persona(principal: models.Usuario, periodos: List[models.Vacacion], actual: dict) -> List[dict]:
+    # Del primer aniversario al ciclo actual, mas el siguiente (con 0 años, el actual y el siguiente)
+    ingreso = principal.fecha_ingreso
+    ciclos: List[dict] = []
+    for anios in range(min(1, actual["anios"]), actual["anios"] + 2):
+        saldo = _calcular_saldo(principal, periodos, _aniversario(ingreso, ingreso.year + anios))
+        if anios < actual["anios"]:
+            estado = "Cerrado"
+        elif anios == actual["anios"]:
+            estado = "Actual"
+        else:
+            estado = "Siguiente"
+        ciclos.append(
+            {
+                **saldo,
+                "estado": estado,
+                # Los dias no se acumulan: lo que sobro de un ciclo cerrado se pierde
+                "dias_perdidos": max(saldo["dias_quedan"], 0.0) if estado == "Cerrado" else None,
+            }
+        )
+    return ciclos
+
+
+@router.get("/panel", response_model=List[PersonaPanel])
+def panel_vacaciones(
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    """Solo lectura: resumen del año de vacaciones actual y todos los ciclos de cada persona activa."""
+    hoy = datetime.now(ZONA_MX).date()
+    # Una persona = cuentas activas de empleado con el mismo nombre_englobado (o username sin englobado)
+    # Consultas fijas: usuarios (con su modulo, joinedload) una vez y vacaciones una vez;
+    # todos los ciclos se calculan en memoria.
+    cuentas: Dict[str, List[models.Usuario]] = {}
+    for u in (
+        db.query(models.Usuario)
+        .options(joinedload(models.Usuario.modulo))
+        .filter(models.Usuario.activo == True, models.Usuario.rol.in_(ROLES_EMPLEADO))
+        .order_by(models.Usuario.id)
+        .all()
+    ):
+        clave = _normalizar(u.nombre_englobado) or _normalizar(u.username)
+        if clave:
+            cuentas.setdefault(clave, []).append(u)
+    periodos = _periodos_saldo(db, cuentas.keys())
+
+    filas = []
+    for clave, lista in cuentas.items():
+        principal = _principal(lista)
+        modulos: List[str] = []
+        for c in lista:
+            if c.modulo and c.modulo.nombre and c.modulo.nombre not in modulos:
+                modulos.append(c.modulo.nombre)
+        fila = {
+            "clave": clave,
+            "nombre_completo": next(
+                (c.nombre_completo.strip() for c in lista if (c.nombre_completo or "").strip()), None
+            ),
+            "modulos": modulos,
+            "fecha_ingreso": principal.fecha_ingreso,
+            "ciclos": [],
+        }
+        actual = _calcular_saldo(principal, periodos.get(clave, []), hoy)
+        if actual:
+            fila.update(
+                {k: actual[k] for k in (
+                    "anios", "dias_corresponden", "dias_tomados", "dias_descuentos",
+                    "dias_solicitados_pendientes", "dias_quedan", "ciclo_inicio", "ciclo_fin",
+                )},
+                dias_para_aniversario=(actual["ciclo_fin"] + timedelta(days=1) - hoy).days,
+                ciclos=_ciclos_persona(principal, periodos.get(clave, []), actual),
+            )
+        filas.append(fila)
+    return sorted(filas, key=lambda f: f["clave"])
 
 
 # ------------------- Reglas de periodos (admin y Mi Perfil) -------------------
