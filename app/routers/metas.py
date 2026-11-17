@@ -235,6 +235,10 @@ def metas_mi_pendiente(
     #
     # "Hoy" sale de la zona de Mexico, no de CURRENT_DATE (que en la BD es
     # UTC): asi la semana no rota el domingo en la noche.
+    #
+    # paga_el va anclado a la semana, no a hoy: se paga la semana antepasada,
+    # el segundo miercoles despues del cierre (lunes + 16). Asi no brinca a
+    # media semana.
     fila = db.execute(text("""
         WITH mis_claves AS (
           SELECT u2.id
@@ -246,8 +250,7 @@ def metas_mi_pendiente(
         SELECT
           s.lunes,
           s.domingo,
-          (CAST(:hoy AS date)
-            + ((3 - EXTRACT(ISODOW FROM CAST(:hoy AS date))::int + 7) % 7)) AS paga_el,
+          (s.lunes + 16) AS paga_el,
           COUNT(DISTINCT s.empleado_id) AS claves,
           COALESCE(SUM(s.a_pagar), 0) AS bono_pendiente
         FROM v_bolsa_semanal s
