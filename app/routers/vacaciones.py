@@ -1,5 +1,8 @@
+import math
+import unicodedata
 from typing import Dict, Iterable, List, Literal, Optional
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -45,6 +48,13 @@ class VacacionResponse(BaseModel):
 
 class SolicitudResponse(VacacionResponse):
     nombre_completo: Optional[str] = None
+    modulos: List[str] = []
+    # Saldo del ciclo vigente (aniversario a aniversario); null sin fecha_ingreso
+    dias_corresponden: Optional[int] = None
+    ciclo_inicio: Optional[date] = None
+    ciclo_fin: Optional[date] = None
+    dias_usados: Optional[float] = None
+    dias_quedan: Optional[float] = None
 
 
 class VacacionCrear(BaseModel):
@@ -181,12 +191,131 @@ def listar_solicitudes(
         .all()
     )
     nombre_por_clave = {f.clave: f.nombre_completo for f in filas}
+    saldos = _saldos_vacaciones(db, claves)
 
     nombres = _nombres_aprobadores(db, vacaciones)
     return [
-        {**_serializar(v, nombres), "nombre_completo": nombre_por_clave.get(_normalizar(v.clave))}
+        {
+            **_serializar(v, nombres),
+            "nombre_completo": nombre_por_clave.get(_normalizar(v.clave)),
+            **saldos.get(_normalizar(v.clave), _SALDO_VACIO),
+        }
         for v in vacaciones
     ]
+
+
+# ------------------- Saldo de vacaciones (solo lectura) -------------------
+ZONA_MX = ZoneInfo("America/Mexico_City")
+ROLES_EMPLEADO = (models.RolEnum.asesor, models.RolEnum.encargado)
+_SALDO_VACIO = {
+    "modulos": [],
+    "dias_corresponden": None,
+    "ciclo_inicio": None,
+    "ciclo_fin": None,
+    "dias_usados": None,
+    "dias_quedan": None,
+}
+
+
+def _dias_lft(anios: int) -> int:
+    # LFT: 1=12, 2=14, 3=16, 4=18, 5=20; de ahi +2 cada 5 anios (6-10=22, 11-15=24, ...)
+    if anios <= 0:
+        return 0
+    if anios <= 5:
+        return 10 + 2 * anios
+    return 20 + 2 * math.ceil((anios - 5) / 5)
+
+
+def _aniversario(ingreso: date, anio: int) -> date:
+    # Quien entro un 29 de febrero cumple el 28 en anios no bisiestos
+    try:
+        return ingreso.replace(year=anio)
+    except ValueError:
+        return date(anio, 2, 28)
+
+
+def _sin_acentos(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto or "") if unicodedata.category(c) != "Mn"
+    ).strip().lower()
+
+
+def _solo_fin_de_semana(horario) -> bool:
+    # Dias trabajados = los que no son descanso y tienen entrada y salida
+    if not isinstance(horario, list):
+        return False
+    trabajados = {
+        _sin_acentos(str(d.get("dia", "")))
+        for d in horario
+        if isinstance(d, dict) and not d.get("descanso") and d.get("entrada") and d.get("salida")
+    }
+    return bool(trabajados) and trabajados <= {"sabado", "domingo"}
+
+
+def _saldos_vacaciones(db: Session, claves: Iterable[str]) -> Dict[str, dict]:
+    claves = {c for c in claves if c}
+    if not claves:
+        return {}
+    hoy = datetime.now(ZONA_MX).date()
+
+    # Misma regla que Mis datos / Mi Perfil: cuentas activas de empleado con ese
+    # nombre_englobado; la principal es la primera (por id) con sueldo > 0.
+    cuentas_por_clave: Dict[str, List[models.Usuario]] = {}
+    for u in (
+        db.query(models.Usuario)
+        .filter(
+            _clave_columna(models.Usuario.nombre_englobado).in_(claves),
+            models.Usuario.activo == True,
+            models.Usuario.rol.in_(ROLES_EMPLEADO),
+        )
+        .order_by(models.Usuario.id)
+        .all()
+    ):
+        cuentas_por_clave.setdefault(_normalizar(u.nombre_englobado), []).append(u)
+
+    aprobadas: Dict[str, List[models.Vacacion]] = {}
+    for v in (
+        db.query(models.Vacacion)
+        .filter(
+            _clave_columna(models.Vacacion.clave).in_(claves),
+            models.Vacacion.tipo == "vacaciones",
+            func.lower(func.trim(models.Vacacion.estado)).in_(("autorizada", "tomada")),
+        )
+        .all()
+    ):
+        aprobadas.setdefault(_normalizar(v.clave), []).append(v)
+
+    saldos: Dict[str, dict] = {}
+    for clave, cuentas in cuentas_por_clave.items():
+        modulos: List[str] = []
+        for c in cuentas:
+            if c.modulo and c.modulo.nombre and c.modulo.nombre not in modulos:
+                modulos.append(c.modulo.nombre)
+        saldo = {**_SALDO_VACIO, "modulos": modulos}
+
+        principal = next((c for c in cuentas if (c.sueldo_base or 0) > 0), cuentas[0])
+        ingreso = principal.fecha_ingreso
+        if ingreso and ingreso <= hoy:
+            anios = hoy.year - ingreso.year - (1 if _aniversario(ingreso, hoy.year) > hoy else 0)
+            ciclo_inicio = _aniversario(ingreso, ingreso.year + anios)
+            ciclo_fin = _aniversario(ingreso, ingreso.year + anios + 1) - timedelta(days=1)
+            corresponden = _dias_lft(anios)
+            if _solo_fin_de_semana(principal.horario_semanal):
+                corresponden = math.ceil(corresponden / 3)
+            usados = sum(
+                float(v.dias or 0)
+                for v in aprobadas.get(clave, [])
+                if ciclo_inicio <= v.fecha_inicio <= ciclo_fin
+            )
+            saldo.update(
+                dias_corresponden=corresponden,
+                ciclo_inicio=ciclo_inicio,
+                ciclo_fin=ciclo_fin,
+                dias_usados=usados,
+                dias_quedan=corresponden - usados,
+            )
+        saldos[clave] = saldo
+    return saldos
 
 
 @router.post("", response_model=VacacionResponse, status_code=201)
