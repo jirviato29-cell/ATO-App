@@ -34,7 +34,9 @@ from sqlalchemy import text
 from app.bot_prompt import PROMPT_BASE, TOOL_RESPONDER
 from app.database import SessionLocal
 
-log = logging.getLogger("bot_whatsapp")
+log = logging.getLogger("uvicorn.error")  # asi los errores salen en el log de Render
+
+ULTIMO_ERROR_ENVIO = {"texto": None}
 
 router = APIRouter()
 
@@ -124,8 +126,10 @@ def _enviar(payload: dict) -> Optional[str]:
     """Envia a la API de WhatsApp. Regresa el id del mensaje o None."""
     token = _env("BOT_WA_TOKEN")
     phone_id = _env("BOT_WA_PHONE_NUMBER_ID")
+    ULTIMO_ERROR_ENVIO["texto"] = None
     if not token or not phone_id:
-        log.error("Faltan BOT_WA_TOKEN o BOT_WA_PHONE_NUMBER_ID")
+        ULTIMO_ERROR_ENVIO["texto"] = "error: faltan BOT_WA_TOKEN o BOT_WA_PHONE_NUMBER_ID"
+        log.error("[bot-whatsapp] Faltan BOT_WA_TOKEN o BOT_WA_PHONE_NUMBER_ID")
         return None
     try:
         r = requests.post(
@@ -135,11 +139,13 @@ def _enviar(payload: dict) -> Optional[str]:
             timeout=20,
         )
         if r.status_code >= 300:
-            log.error("Error al enviar WhatsApp %s: %s", r.status_code, r.text[:500])
+            ULTIMO_ERROR_ENVIO["texto"] = f"error {r.status_code}: {r.text[:300]}"
+            log.error("[bot-whatsapp] Error al enviar WhatsApp %s: %s", r.status_code, r.text[:500])
             return None
         return ((r.json().get("messages") or [{}])[0]).get("id")
-    except Exception:
-        log.exception("Excepcion al enviar WhatsApp")
+    except Exception as e:
+        ULTIMO_ERROR_ENVIO["texto"] = f"error: {e}"[:300]
+        log.exception("[bot-whatsapp] Excepcion al enviar WhatsApp")
         return None
 
 
@@ -164,7 +170,7 @@ def guardar_saliente(db, conv_id: int, wa_message_id: Optional[str], autor: str,
             ON CONFLICT (wa_message_id) DO NOTHING
         """),
         {"c": conv_id, "w": wa_message_id, "a": autor, "t": tipo, "x": texto,
-         "e": "enviado" if wa_message_id else "error"},
+         "e": "enviado" if wa_message_id else (ULTIMO_ERROR_ENVIO["texto"] or "error")},
     )
 
 
