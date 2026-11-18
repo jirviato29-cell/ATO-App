@@ -1,5 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,6 +10,7 @@ from app.config import get_current_user
 from app.database import get_db
 from app.routers.vacaciones import (
     ZONA_MX,
+    DiasExtraResponse,
     SaldoResponse,
     VacacionResponse,
     _clave_columna,
@@ -19,11 +20,16 @@ from app.routers.vacaciones import (
     _texto_fecha,
     _usuario_activo,
     candado_persona,
+    dias_extra_de,
+    festivos_de,
     periodos_guardados,
     saldo_actual_y_siguiente,
     validar_contra_periodos,
+    validar_dias_extra,
+    validar_fechas_dia_extra_empleado,
     validar_fechas_vacaciones,
     validar_saldo,
+    validar_tope_seguidos,
 )
 
 router = APIRouter()
@@ -156,6 +162,8 @@ class SolicitudVacacion(BaseModel):
     # Opcional: si no lo pone la persona, admin lo asigna con PATCH /vacaciones/{id}/cubre
     cubre_clave: Optional[str] = Field(None, max_length=50)
     nota: Optional[str] = Field(None, max_length=500)
+    # "dia_extra": día de descanso extra (no sale del saldo de vacaciones)
+    tipo: Literal["vacaciones", "dia_extra"] = "vacaciones"
 
 
 def _es_piloto(usuario: models.Usuario) -> bool:
@@ -165,6 +173,18 @@ def _es_piloto(usuario: models.Usuario) -> bool:
 def _exigir_piloto(usuario: models.Usuario) -> None:
     if not _es_piloto(usuario):
         raise HTTPException(status_code=403, detail="Esta función todavía no está disponible para tu usuario")
+
+
+@router.get("/dias-extra", response_model=DiasExtraResponse)
+def mis_dias_extra(
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(get_current_user),
+):
+    # Días de descanso extra de la propia persona; sin englobado no hay
+    englobado = (usuario.nombre_englobado or "").strip()
+    if not englobado:
+        return {"clave": "", "dias_disponibles": 0, "vence": None, "dias_usados": 0, "dias_pendientes": 0, "otorgados": []}
+    return dias_extra_de(db, englobado)
 
 
 @router.post("/vacaciones", response_model=VacacionResponse, status_code=201)
@@ -191,17 +211,22 @@ def pedir_vacaciones(
             detail=f"Los días no coinciden con las fechas: del {_texto_fecha(inicio)} al {_texto_fecha(fin)} son {dias}",
         )
     hoy = datetime.now(ZONA_MX).date()
-    primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION)
-    if inicio < primer_dia:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Las vacaciones se piden con {DIAS_ANTICIPACION} días de anticipación: "
-                f"puedes empezar a partir del {_texto_fecha(primer_dia)}"
-            ),
-        )
+    es_extra = body.tipo == "dia_extra"
+    if es_extra:
+        # Ventana especial del festivo (sin anticipación) o 20 días; bloqueos siempre
+        validar_fechas_dia_extra_empleado(inicio, fin, hoy, festivos_de(db, clave_norm))
+    else:
+        primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION)
+        if inicio < primer_dia:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Las vacaciones se piden con {DIAS_ANTICIPACION} días de anticipación: "
+                    f"puedes empezar a partir del {_texto_fecha(primer_dia)}"
+                ),
+            )
 
-    validar_fechas_vacaciones(inicio, fin, tu=True)
+        validar_fechas_vacaciones(inicio, fin, tu=True)
 
     cubre = None
     if (body.cubre_clave or "").strip():
@@ -226,9 +251,15 @@ def pedir_vacaciones(
                 ),
             )
 
-    validar_contra_periodos(existentes, inicio, fin, tu=True)
-    # Sin adelantos: contra el año de vacaciones donde cae fecha_inicio
-    validar_saldo(db, clave_norm, inicio, dias, tu=True)
+    if es_extra:
+        # Máximo 6 seguidos junto con vacaciones; que alcancen los días extra
+        validar_tope_seguidos(existentes, inicio, fin, tu=True)
+        validar_dias_extra(db, clave_norm, existentes, inicio, fin, tu=True)
+    else:
+        validar_contra_periodos(existentes, inicio, fin, tu=True)
+        validar_tope_seguidos(existentes, inicio, fin, tu=True)
+        # Sin adelantos: contra el año de vacaciones donde cae fecha_inicio
+        validar_saldo(db, clave_norm, inicio, dias, tu=True)
 
     nota = (body.nota or "").strip() or None
     vacacion = models.Vacacion(
@@ -237,7 +268,7 @@ def pedir_vacaciones(
         fecha_fin=fin,
         dias=dias,
         estado="solicitada",
-        tipo="vacaciones",
+        tipo=body.tipo,
         origen="mi_perfil",
         nota=nota,
         creado_por=usuario.id,
@@ -277,7 +308,7 @@ def cancelar_solicitud(
     # Ej.: inicio 11/01/2027 -> se puede cancelar hasta el 04/01/2027 inclusive.
     hoy = datetime.now(ZONA_MX).date()
     cancelable = (
-        vacacion.tipo == "vacaciones"
+        vacacion.tipo in ("vacaciones", "dia_extra")
         and (vacacion.estado or "").strip().lower() in ("solicitada", "autorizada")
         and (vacacion.fecha_inicio - hoy).days >= DIAS_PARA_CANCELAR
     )
