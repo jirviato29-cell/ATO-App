@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app import models
@@ -20,6 +21,8 @@ router = APIRouter()
 # compara con UPPER(TRIM()), porque los datos cargados de Excel no son uniformes.
 
 NIVELES = ("rh", "encargado", "gerencia")
+# Lo que pasa por RH, Encargado y Gerencia
+TIPOS_CON_APROBACION = ("vacaciones", "dia_extra")
 
 solo_admin = verificar_rol_requerido(models.RolEnum.admin)
 
@@ -113,7 +116,7 @@ class VacacionCrear(BaseModel):
     fecha_inicio: date
     fecha_fin: date
     dias: float = Field(..., gt=0, le=999.9)
-    tipo: Literal["vacaciones", "falta_injustificada"]
+    tipo: Literal["vacaciones", "falta_injustificada", "dia_extra"]
     nota: Optional[str] = None
 
 
@@ -129,6 +132,40 @@ class DescuentoCrear(BaseModel):
 
 
 CrearBody = Annotated[Union[VacacionCrear, DescuentoCrear], Field(discriminator="tipo")]
+
+
+class DiaExtraCrear(BaseModel):
+    # Otorgar días de descanso extra (admin). extra="forbid": vence lo calcula la BD.
+    model_config = ConfigDict(extra="forbid")
+
+    clave: str = Field(..., min_length=1, max_length=50)
+    fecha_festivo: date
+    dias: int = Field(..., ge=1, le=6)
+    motivo: str = Field(..., min_length=1, max_length=500)
+
+
+class DiaExtraOtorgado(BaseModel):
+    id: int
+    clave: str
+    fecha_festivo: date
+    vence: date
+    dias: int
+    motivo: str
+    creado_at: Optional[datetime] = None
+    dias_asignados: int  # días pedidos o tomados que salen de este otorgamiento
+    dias_restantes: int
+    vigente: bool  # hoy <= vence
+
+
+class DiasExtraResponse(BaseModel):
+    clave: str
+    # Lo que todavía puede pedir: otorgados vigentes menos lo ya pedido o tomado
+    dias_disponibles: int
+    # Vencimiento más cercano de los días disponibles (null si no hay)
+    vence: Optional[date] = None
+    dias_usados: int  # autorizados o tomados
+    dias_pendientes: int  # solicitados
+    otorgados: List[DiaExtraOtorgado] = []
 
 
 class AprobacionBody(BaseModel):
@@ -236,7 +273,7 @@ def listar_solicitudes(
     vacaciones = (
         db.query(models.Vacacion)
         .filter(
-            models.Vacacion.tipo == "vacaciones",
+            models.Vacacion.tipo.in_(TIPOS_CON_APROBACION),
             models.Vacacion.estado == "solicitada",
         )
         .order_by(models.Vacacion.fecha_inicio, models.Vacacion.id)
@@ -443,8 +480,12 @@ def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[
         for c in cuentas[clave]:
             if c.modulo and c.modulo.nombre and c.modulo.nombre not in modulos:
                 modulos.append(c.modulo.nombre)
-        saldo = _calcular_saldo(_principal(cuentas[clave]), periodos.get(clave, []), v.fecha_inicio)
         datos = {**_SALDO_VACIO, "modulos": modulos}
+        # Un día extra no sale del saldo de vacaciones: sin columnas de saldo
+        if v.tipo == "dia_extra":
+            resultado[v.id] = datos
+            continue
+        saldo = _calcular_saldo(_principal(cuentas[clave]), periodos.get(clave, []), v.fecha_inicio)
         if saldo:
             datos.update({k: saldo[k] for k in _SALDO_VACIO if k in saldo})
         resultado[v.id] = datos
@@ -532,8 +573,8 @@ MAX_DIAS_SEGUIDOS = 6
 DIAS_ENTRE_PERIODOS = 15
 # Periodos que ya cuentan para "uno por mes" y para la separacion de 15 dias
 ESTADOS_VIGENTES = ("solicitada", "autorizada", "tomada")
-# Ni las faltas ni los descuentos son periodos de vacaciones
-TIPOS_SIN_REGLAS = ("falta_injustificada", "descuento")
+# Ni las faltas, ni los descuentos, ni los días extra cuentan para "uno por mes" ni para los 15 días
+TIPOS_SIN_REGLAS = ("falta_injustificada", "descuento", "dia_extra")
 
 MESES = (
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -654,6 +695,344 @@ def periodos_guardados(db: Session, clave_norm: str) -> List[models.Vacacion]:
     )
 
 
+# ------------------- Días de descanso extra -------------------
+# Se otorgan en la tabla dias_extra (vence = festivo + 1 año - 1 día) y se piden
+# como filas de vacaciones con tipo 'dia_extra'. No salen del saldo de vacaciones
+# ni cuentan para "uno por mes" o los 15 días; sí para empalme y para el máximo
+# de 6 días seguidos junto con vacaciones.
+
+# Empleado fuera de una ventana especial: 20 días de anticipación. Mismo criterio
+# que vacaciones ("30 días" = primer día elegible hoy + 31): primer día = hoy + 21.
+DIAS_ANTICIPACION_EXTRA = 21
+
+# Ventanas especiales por festivo: dentro de ellas el empleado pide sin anticipación
+# (desde mañana). Para otro festivo, agregar otra entrada.
+VENTANAS_DIA_EXTRA = (
+    {
+        "fecha_festivo": date(2026, 11, 16),
+        "inicio": date(2026, 11, 19),
+        "fin": date(2026, 12, 4),
+        "solo_entre_semana": True,
+    },
+)
+
+# Tipos que se suman para el máximo de días seguidos
+TIPOS_SEGUIDOS = ("vacaciones", "dia_extra")
+
+_DIAS_SEMANA = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+
+
+def _rango(inicio: date, fin: date) -> List[date]:
+    return [inicio + timedelta(days=n) for n in range((fin - inicio).days + 1)]
+
+
+def validar_dias_enteros(inicio: date, fin: date, dias: float) -> None:
+    if fin < inicio:
+        raise HTTPException(status_code=400, detail="fecha_fin no puede ser anterior a fecha_inicio")
+    total = (fin - inicio).days + 1
+    if float(dias) != float(total):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Los días extra van enteros: del {_texto_fecha(inicio)} al {_texto_fecha(fin)} son {total}",
+        )
+
+
+def validar_tope_seguidos(existentes: List[models.Vacacion], inicio: date, fin: date, tu: bool) -> None:
+    """Máximo de días seguidos contando vacaciones y días extra pegados (no rechazados)."""
+    ocupados = set(_rango(inicio, fin))
+    for v in existentes:
+        if v.tipo in TIPOS_SEGUIDOS and (v.estado or "").strip().lower() in ESTADOS_VIGENTES:
+            ocupados.update(_rango(v.fecha_inicio, v.fecha_fin))
+    desde, hasta = inicio, fin
+    while desde - timedelta(days=1) in ocupados:
+        desde -= timedelta(days=1)
+    while hasta + timedelta(days=1) in ocupados:
+        hasta += timedelta(days=1)
+    seguidos = (hasta - desde).days + 1
+    if seguidos > MAX_DIAS_SEGUIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Máximo {MAX_DIAS_SEGUIDOS} días seguidos contando vacaciones y días extra: "
+                f"del {_texto_fecha(desde)} al {_texto_fecha(hasta)} serían {seguidos}"
+            ),
+        )
+
+
+def _otorgados(db: Session, claves: Optional[Iterable[str]] = None) -> Dict[str, List[models.DiaExtra]]:
+    """Otorgamientos por clave. Sin claves: los de todas las personas (panel)."""
+    query = db.query(models.DiaExtra)
+    if claves is not None:
+        claves = {c for c in claves if c}
+        if not claves:
+            return {}
+        query = query.filter(_clave_columna(models.DiaExtra.clave).in_(claves))
+    resultado: Dict[str, List[models.DiaExtra]] = {}
+    for o in query.order_by(models.DiaExtra.vence, models.DiaExtra.id).all():
+        resultado.setdefault(_normalizar(o.clave), []).append(o)
+    return resultado
+
+
+def _usos_dia_extra(periodos: Iterable[models.Vacacion]) -> List[models.Vacacion]:
+    return [
+        v for v in periodos
+        if v.tipo == "dia_extra" and (v.estado or "").strip().lower() in ESTADOS_VIGENTES
+    ]
+
+
+def _dias_de(periodos: Iterable[models.Vacacion]) -> List[date]:
+    return [d for v in periodos for d in _rango(v.fecha_inicio, v.fecha_fin)]
+
+
+def _asignar(otorgados: List[models.DiaExtra], dias: Iterable[date]):
+    """Cada día pedido sale del otorgamiento vigente para ese día que vence primero.
+    Regresa (días asignados por id de otorgamiento, días que no alcanzaron)."""
+    asignados = {o.id: 0 for o in otorgados}
+    ordenados = sorted(otorgados, key=lambda o: (o.vence, o.id))
+    sin_cubrir: List[date] = []
+    for d in sorted(dias):
+        o = next(
+            (o for o in ordenados if o.fecha_festivo <= d <= o.vence and asignados[o.id] < int(o.dias)),
+            None,
+        )
+        if o is None:
+            sin_cubrir.append(d)
+        else:
+            asignados[o.id] += 1
+    return asignados, sin_cubrir
+
+
+def resumen_dias_extra(otorgados: List[models.DiaExtra], periodos: Iterable[models.Vacacion], hoy: date) -> dict:
+    usos = _usos_dia_extra(periodos)
+    asignados, _ = _asignar(otorgados, _dias_de(usos))
+    detalle = []
+    disponibles = 0
+    vence = None
+    for o in otorgados:
+        restantes = max(int(o.dias) - asignados.get(o.id, 0), 0)
+        vigente = o.vence >= hoy
+        if vigente and restantes > 0:
+            disponibles += restantes
+            vence = o.vence if vence is None else min(vence, o.vence)
+        detalle.append(
+            {
+                "id": o.id,
+                "clave": o.clave,
+                "fecha_festivo": o.fecha_festivo,
+                "vence": o.vence,
+                "dias": int(o.dias),
+                "motivo": o.motivo,
+                "creado_at": o.creado_at,
+                "dias_asignados": asignados.get(o.id, 0),
+                "dias_restantes": restantes,
+                "vigente": vigente,
+            }
+        )
+    estado = lambda v: (v.estado or "").strip().lower()  # noqa: E731
+    return {
+        "dias_disponibles": disponibles,
+        "vence": vence,
+        "dias_usados": int(sum(float(v.dias or 0) for v in usos if estado(v) in ("autorizada", "tomada"))),
+        "dias_pendientes": int(sum(float(v.dias or 0) for v in usos if estado(v) == "solicitada")),
+        "otorgados": detalle,
+    }
+
+
+def dias_extra_de(db: Session, clave: str) -> dict:
+    clave_norm = _normalizar(clave)
+    hoy = datetime.now(ZONA_MX).date()
+    resumen = resumen_dias_extra(
+        _otorgados(db, [clave_norm]).get(clave_norm, []), periodos_guardados(db, clave_norm), hoy
+    )
+    return {"clave": clave_norm, **resumen}
+
+
+def festivos_de(db: Session, clave_norm: str) -> List[date]:
+    return [o.fecha_festivo for o in _otorgados(db, [clave_norm]).get(clave_norm, [])]
+
+
+def validar_dias_extra(
+    db: Session, clave_norm: str, existentes: List[models.Vacacion], inicio: date, fin: date, tu: bool
+) -> None:
+    """Que alcancen los días extra: cada día debe caer entre un festivo y su vencimiento,
+    en un otorgamiento con días sin usar. Llamar después del candado de la persona."""
+    otorgados = _otorgados(db, [clave_norm]).get(clave_norm, [])
+    if not otorgados:
+        raise HTTPException(status_code=400, detail=f"No {'tienes' if tu else 'tiene'} días de descanso extra")
+    previos = _dias_de(_usos_dia_extra(existentes))
+    _, sin_cubrir = _asignar(otorgados, previos + _rango(inicio, fin))
+    if not sin_cubrir:
+        return
+    d = sin_cubrir[0]
+    if not any(o.fecha_festivo <= d <= o.vence for o in otorgados):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"El {_texto_fecha(d)} no está dentro de la vigencia de {'tus' if tu else 'sus'} días extra "
+                f"(del festivo a su vencimiento)"
+            ),
+        )
+    asignados, _ = _asignar(otorgados, previos)
+    quedan = sum(max(int(o.dias) - asignados[o.id], 0) for o in otorgados if o.vence >= inicio)
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"No {'te' if tu else 'le'} alcanzan los días extra: "
+            f"{'te' if tu else 'le'} {'queda' if quedan == 1 else 'quedan'} {quedan}"
+        ),
+    )
+
+
+def ventana_dia_extra(d: date, festivos: Iterable[date]) -> Optional[dict]:
+    festivos = set(festivos)
+    return next(
+        (v for v in VENTANAS_DIA_EXTRA if v["fecha_festivo"] in festivos and v["inicio"] <= d <= v["fin"]),
+        None,
+    )
+
+
+def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date, festivos: Iterable[date]) -> None:
+    """Empleado: dentro de una ventana especial de su festivo, sin anticipación (desde mañana)
+    y, si la ventana lo pide, solo lunes a viernes; fuera de ella, 20 días de anticipación.
+    Las fechas bloqueadas aplican siempre."""
+    festivos = list(festivos)
+    primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION_EXTRA)
+    for d in _rango(inicio, fin):
+        if _dia_bloqueado(d):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"El {_texto_fecha(d)} está en periodo de ventas (7 dic - 7 ene o 13 - 16 nov): "
+                    f"no se pueden pedir días extra"
+                ),
+            )
+        ventana = ventana_dia_extra(d, festivos)
+        if ventana:
+            if d <= hoy:
+                raise HTTPException(status_code=400, detail="Los días extra se piden a partir de mañana")
+            if ventana["solo_entre_semana"] and d.weekday() >= 5:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Del {_texto_fecha(ventana['inicio'])} al {_texto_fecha(ventana['fin'])} el día extra "
+                        f"solo se puede de lunes a viernes: el {_texto_fecha(d)} es {_DIAS_SEMANA[d.weekday()]}"
+                    ),
+                )
+        elif d < primer_dia:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Los días extra se piden con 20 días de anticipación: "
+                    f"puedes pedir a partir del {_texto_fecha(primer_dia)}"
+                ),
+            )
+
+
+@router.get("/dias-extra", response_model=DiasExtraResponse)
+def ver_dias_extra(
+    clave: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    return dias_extra_de(db, clave)
+
+
+@router.get("/dias-extra/panel", response_model=List[DiasExtraResponse])
+def panel_dias_extra(
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    """Columna "Días extra" del Panel de control: una fila por persona con días otorgados.
+    Va aparte de GET /panel para no cambiar esa respuesta. Dos consultas fijas."""
+    hoy = datetime.now(ZONA_MX).date()
+    otorgados = _otorgados(db)
+    if not otorgados:
+        return []
+    periodos: Dict[str, List[models.Vacacion]] = {}
+    for v in (
+        db.query(models.Vacacion)
+        .filter(
+            _clave_columna(models.Vacacion.clave).in_(otorgados.keys()),
+            models.Vacacion.tipo == "dia_extra",
+        )
+        .all()
+    ):
+        periodos.setdefault(_normalizar(v.clave), []).append(v)
+    return [
+        {"clave": clave, **resumen_dias_extra(lista, periodos.get(clave, []), hoy)}
+        for clave, lista in sorted(otorgados.items())
+    ]
+
+
+@router.post("/dias-extra", response_model=DiasExtraResponse, status_code=201)
+def otorgar_dias_extra(
+    body: DiaExtraCrear,
+    db: Session = Depends(get_db),
+    admin: models.Usuario = Depends(solo_admin),
+):
+    usuario = _usuario_activo(db, body.clave)
+    if usuario is None:
+        raise HTTPException(status_code=400, detail="La clave no corresponde a un usuario activo")
+    motivo = body.motivo.strip()
+    if not motivo:
+        raise HTTPException(status_code=400, detail="El motivo es obligatorio")
+    if body.fecha_festivo > datetime.now(ZONA_MX).date():
+        raise HTTPException(status_code=400, detail="La fecha del festivo no puede ser futura")
+    clave_norm = _normalizar(body.clave)
+    candado_persona(db, clave_norm)
+    repetido = (
+        db.query(models.DiaExtra)
+        .filter(
+            _clave_columna(models.DiaExtra.clave) == clave_norm,
+            models.DiaExtra.fecha_festivo == body.fecha_festivo,
+        )
+        .first()
+    )
+    mensaje_repetido = f"Ya tiene días extra por el festivo del {_texto_fecha(body.fecha_festivo)}"
+    if repetido:
+        raise HTTPException(status_code=409, detail=mensaje_repetido)
+    db.add(
+        models.DiaExtra(
+            clave=usuario.nombre_englobado.strip(),
+            fecha_festivo=body.fecha_festivo,
+            dias=body.dias,
+            motivo=motivo,
+            creado_por=admin.id,
+            creado_at=datetime.now(timezone.utc),
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        # Índice único (clave, festivo): doble envío al mismo tiempo
+        db.rollback()
+        raise HTTPException(status_code=409, detail=mensaje_repetido)
+    return dias_extra_de(db, clave_norm)
+
+
+@router.delete("/dias-extra/{otorgado_id}")
+def quitar_dias_extra(
+    otorgado_id: int,
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    otorgado = db.query(models.DiaExtra).filter(models.DiaExtra.id == otorgado_id).first()
+    if otorgado is None:
+        raise HTTPException(status_code=404, detail="Otorgamiento no encontrado")
+    clave_norm = _normalizar(otorgado.clave)
+    candado_persona(db, clave_norm)
+    resto = [o for o in _otorgados(db, [clave_norm]).get(clave_norm, []) if o.id != otorgado.id]
+    _, sin_cubrir = _asignar(resto, _dias_de(_usos_dia_extra(periodos_guardados(db, clave_norm))))
+    if sin_cubrir:
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede quitar: hay días extra pedidos o tomados que salen de este otorgamiento",
+        )
+    db.delete(otorgado)
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/saldo", response_model=SaldoResponse)
 def ver_saldo(
     clave: str = Query(..., min_length=1),
@@ -685,8 +1064,12 @@ def crear_vacacion(
     # pasadas), pero si: maximo de dias, bloqueos, uno por mes, 15 dias y saldo.
     # Las faltas injustificadas siguen sin reglas.
     es_vacacion = body.tipo == "vacaciones"
+    es_extra = body.tipo == "dia_extra"
     if es_vacacion:
         validar_fechas_vacaciones(body.fecha_inicio, body.fecha_fin, tu=False)
+    if es_extra:
+        # Admin: cualquier fecha (sin anticipación, ventana ni bloqueos), días enteros
+        validar_dias_enteros(body.fecha_inicio, body.fecha_fin, body.dias)
 
     candado_persona(db, clave_norm)
     existentes = periodos_guardados(db, clave_norm)
@@ -710,9 +1093,13 @@ def crear_vacacion(
 
     if es_vacacion:
         validar_contra_periodos(existentes, body.fecha_inicio, body.fecha_fin, tu=False)
+        validar_tope_seguidos(existentes, body.fecha_inicio, body.fecha_fin, tu=False)
         validar_saldo(db, clave_norm, body.fecha_inicio, body.dias, tu=False)
+    if es_extra:
+        validar_tope_seguidos(existentes, body.fecha_inicio, body.fecha_fin, tu=False)
+        validar_dias_extra(db, clave_norm, existentes, body.fecha_inicio, body.fecha_fin, tu=False)
 
-    if not es_vacacion:
+    if not es_vacacion and not es_extra:
         estado = "autorizada"
     elif body.fecha_fin < datetime.now(ZONA_MX).date():
         # Vacaciones que ya pasaron: se capturan como tomadas
@@ -775,7 +1162,7 @@ def registrar_aprobacion(
     admin: models.Usuario = Depends(solo_admin),
 ):
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
-    if vacacion.tipo != "vacaciones" or vacacion.estado != "solicitada":
+    if vacacion.tipo not in TIPOS_CON_APROBACION or vacacion.estado != "solicitada":
         raise HTTPException(
             status_code=409,
             detail="Solo se pueden aprobar vacaciones en estado solicitada",

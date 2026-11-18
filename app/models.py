@@ -1,13 +1,13 @@
 import enum
 from sqlite3.dbapi2 import Timestamp
-from sqlalchemy import BigInteger, Boolean, Column, Date, Float, Integer, JSON, Numeric, String, Text, Enum, DateTime, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, Column, Date, Float, Integer, JSON, Numeric, String, Text, Enum, DateTime, Time, UniqueConstraint, func, Computed
 import sqlalchemy
 from .database import Base
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy import ForeignKey
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import declarative_base, relationship
 
 
 class RolEnum(str, enum.Enum):
@@ -955,3 +955,24 @@ class Vacacion(Base):
     aprobado_gerencia_por = Column(Integer)
     aprobado_gerencia_at = Column(DateTime(timezone=True))
     cubre_clave = Column(String(50))  # nombre_englobado de quien cubre
+
+
+# Base aparte, FUERA de Base.metadata: el create_all de main.py nunca crea ni
+# toca esta tabla. Se crea a mano en Supabase (CREATE TABLE dias_extra ...).
+BaseManual = declarative_base()
+
+
+class DiaExtra(BaseManual):
+    # Días de descanso extra otorgados por admin (p. ej. por trabajar un festivo).
+    # Lo que la persona PIDE va en vacaciones con tipo 'dia_extra'.
+    __tablename__ = "dias_extra"
+
+    id = Column(Integer, primary_key=True)
+    clave = Column(String(50), nullable=False)  # nombre_englobado
+    fecha_festivo = Column(Date, nullable=False)
+    # Columna generada en la BD: fecha_festivo + 1 año - 1 día. Solo se lee.
+    vence = Column(Date, Computed("((fecha_festivo + INTERVAL '1 year')::date - 1)", persisted=True))
+    dias = Column(Integer, nullable=False)
+    motivo = Column(Text, nullable=False)
+    creado_por = Column(Integer)
+    creado_at = Column(DateTime(timezone=True))
