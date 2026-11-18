@@ -2769,3 +2769,30 @@ def marcar_portabilidad(
         portabilidad_realizada=bool(chip.portabilidad_realizada),
         fecha_portabilidad=chip.fecha_portabilidad,
     )
+
+
+# "Eliminar" una portabilidad = cancelarla (cancelada = true), no borrarla:
+# el renglón de venta_chips cuenta en nómina, comisiones y reportes, y todos
+# esos cálculos ya ignoran las canceladas. Así queda rastro.
+@router.delete("/portabilidades/{venta_id}")
+def cancelar_portabilidad(
+    venta_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(verificar_rol_requerido([models.RolEnum.admin])),
+):
+    chip = (
+        db.query(models.VentaChip)
+        .filter(
+            models.VentaChip.id == venta_id,
+            models.VentaChip.tipo_chip.in_(TIPOS_PORTABILIDAD),
+        )
+        .first()
+    )
+    if not chip:
+        raise HTTPException(status_code=404, detail="Portabilidad no encontrada")
+
+    if not chip.cancelada:
+        chip.cancelada = True
+        db.commit()
+
+    return {"id": chip.id, "cancelada": True}
