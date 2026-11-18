@@ -9,7 +9,6 @@ from app import models
 from app.config import get_current_user
 from app.database import get_db
 from app.routers.vacaciones import (
-    NIVELES,
     ZONA_MX,
     SaldoResponse,
     VacacionResponse,
@@ -142,6 +141,8 @@ PILOTO_MI_PERFIL = ("A55BO-EVELYN",)
 # Las demas reglas (maximo de dias, bloqueos, uno por mes, 15 dias, saldo) son las
 # mismas que POST /vacaciones de admin y viven en app/routers/vacaciones.py.
 DIAS_ANTICIPACION = 31
+# El empleado puede cancelar sus vacaciones hasta 7 días antes de que empiecen
+DIAS_PARA_CANCELAR = 7
 
 
 class SolicitudVacacion(BaseModel):
@@ -271,10 +272,20 @@ def cancelar_solicitud(
     # Solo las que la persona pidió desde Mi Perfil; las capturadas por admin (sistema) o de Excel no
     if vacacion.origen != "mi_perfil":
         raise HTTPException(status_code=400, detail="Solo puedes cancelar solicitudes que hiciste desde Mi Perfil")
-    if vacacion.tipo != "vacaciones" or (vacacion.estado or "").strip().lower() != "solicitada":
-        raise HTTPException(status_code=400, detail="Solo se pueden cancelar solicitudes que sigan en estado solicitada")
-    if any(getattr(vacacion, f"aprobado_{nivel}") is not None for nivel in NIVELES):
-        raise HTTPException(status_code=400, detail="Esta solicitud ya tiene una revisión; ya no se puede cancelar")
+    # Regla: vacaciones solicitadas o autorizadas (aunque ya tengan visto bueno de RH, Encargado
+    # o Gerencia) se cancelan hasta 7 días antes de fecha_inicio, con "hoy" en hora de México.
+    # Ej.: inicio 11/01/2027 -> se puede cancelar hasta el 04/01/2027 inclusive.
+    hoy = datetime.now(ZONA_MX).date()
+    cancelable = (
+        vacacion.tipo == "vacaciones"
+        and (vacacion.estado or "").strip().lower() in ("solicitada", "autorizada")
+        and (vacacion.fecha_inicio - hoy).days >= DIAS_PARA_CANCELAR
+    )
+    if not cancelable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ya no se puede cancelar: faltan menos de {DIAS_PARA_CANCELAR} días. Habla con RH.",
+        )
 
     db.delete(vacacion)
     db.commit()
