@@ -66,9 +66,9 @@ def _leer_config(db) -> dict:
 def _firma_valida(cuerpo: bytes, firma: Optional[str]) -> bool:
     secreto = _env("BOT_WA_APP_SECRET")
     if not secreto:
-        # Sin secreto configurado no se puede validar; se acepta pero se avisa.
-        log.warning("BOT_WA_APP_SECRET no configurado: no se valida la firma de Meta")
-        return True
+        # Sin secreto no se puede validar que el mensaje venga de Meta: se rechaza.
+        log.error("BOT_WA_APP_SECRET no configurado: se rechazan los mensajes del webhook")
+        return False
     if not firma or not firma.startswith("sha256="):
         return False
     esperado = hmac.new(secreto.encode(), cuerpo, hashlib.sha256).hexdigest()
