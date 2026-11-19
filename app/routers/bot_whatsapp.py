@@ -230,18 +230,21 @@ def _equipos_en_existencia(db) -> str:
 
 def _prompt_sistema(cfg: dict, paso: int, datos: dict, equipos: str = "") -> str:
     partes = [PROMPT_BASE]
+    if cfg.get("ofertas"):
+        partes.append("## Ofertas vigentes / promoción (es lo PRIMERO que ofreces; úsalas tal cual, no inventes otras)\n" + cfg["ofertas"])
     if equipos:
         partes.append(
-            "## Equipos Telcel en existencia hoy (inventario real de ATO)\n"
-            "Solo ofrece equipos de esta lista. Si preguntan por uno que no está, di que por ahora no lo tenemos y ofrece uno parecido de la lista.\n"
+            "## Otros equipos Telcel en existencia hoy (inventario real de ATO)\n"
+            "PRIORIDAD: siempre ofrece primero el equipo de la promoción vigente (sección \"Ofertas vigentes\"). "
+            "NO menciones esta lista por tu cuenta. Úsala SOLO si el cliente pide ver otros modelos, pregunta por un modelo en específico, "
+            "o dice que el de la promoción no le interesa. Aun así, recuérdale amable la promoción.\n"
+            "Si pregunta por un modelo que no está en la lista, di que por ahora no lo tenemos y ofrece la promoción o uno parecido.\n"
             "- Precio de contado: dalo SOLO si el cliente pregunta por contado o por cuánto cuesta el equipo de contado.\n"
             "- En plan: el pago inicial y la mensualidad dependen de la evaluación de Telcel; no des cifras, se las manda el asesor en su cotización.\n"
             "- Colores: no los tenemos en sistema; dile que el asesor le confirma colores disponibles.\n"
             "- También se pueden llevar en abonos con Paguitos o PayJoy en nuestros módulos.\n"
             + equipos
         )
-    if cfg.get("ofertas"):
-        partes.append("## Ofertas vigentes (úsalas tal cual, no inventes otras)\n" + cfg["ofertas"])
     if cfg.get("preguntas_frecuentes"):
         partes.append("## Preguntas frecuentes (responde así)\n" + cfg["preguntas_frecuentes"])
     if cfg.get("reglas_extra"):
