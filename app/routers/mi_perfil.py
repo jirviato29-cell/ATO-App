@@ -1,11 +1,11 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app import models
+from app import avisos, models
 from app.config import get_current_user
 from app.database import get_db
 from app.routers.vacaciones import (
@@ -190,6 +190,7 @@ def mis_dias_extra(
 @router.post("/vacaciones", response_model=VacacionResponse, status_code=201)
 def pedir_vacaciones(
     body: SolicitudVacacion,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(get_current_user),
 ):
@@ -278,12 +279,15 @@ def pedir_vacaciones(
     db.add(vacacion)
     db.commit()
     db.refresh(vacacion)
+    # Aviso a administración, después del commit y fuera de la petición: nunca rompe la solicitud
+    background_tasks.add_task(avisos.solicitud_nueva, clave, body.tipo, inicio, fin, dias, vacacion.id)
     return _serializar(vacacion, {})
 
 
 @router.delete("/vacaciones/{vacacion_id}")
 def cancelar_solicitud(
     vacacion_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(get_current_user),
 ):
@@ -318,6 +322,9 @@ def cancelar_solicitud(
             detail=f"Ya no se puede cancelar: faltan menos de {DIAS_PARA_CANCELAR} días. Habla con RH.",
         )
 
+    # Datos del aviso ANTES de borrar la fila
+    datos_aviso = (vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.dias, vacacion.id)
     db.delete(vacacion)
     db.commit()
+    background_tasks.add_task(avisos.solicitud_cancelada, *datos_aviso)
     return {"ok": True}

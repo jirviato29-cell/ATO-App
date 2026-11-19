@@ -18,6 +18,7 @@ from app.routers import vacaciones
 from app.routers import mi_perfil
 from app.routers import promociones
 from app.routers import bot_whatsapp
+from app.routers import mensajes
 from fastapi.middleware.cors import CORSMiddleware
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
@@ -80,3 +81,4 @@ app.include_router(vacaciones.router, prefix="/vacaciones", tags=["Vacaciones"])
 app.include_router(mi_perfil.router, prefix="/mi-perfil", tags=["Mi Perfil"])
 app.include_router(promociones.router, prefix="/promociones", tags=["Promociones"])
 app.include_router(bot_whatsapp.router, prefix="/bot-whatsapp", tags=["Bot WhatsApp"])
+app.include_router(mensajes.router, prefix="/mensajes", tags=["Mensajes"])

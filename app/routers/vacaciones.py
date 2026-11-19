@@ -4,13 +4,13 @@ from typing import Annotated, Dict, Iterable, List, Literal, Optional, Union
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from app import models
+from app import avisos, models
 from app.database import get_db
 from app.utilidades import verificar_rol_requerido
 
@@ -967,6 +967,7 @@ def panel_dias_extra(
 @router.post("/dias-extra", response_model=DiasExtraResponse, status_code=201)
 def otorgar_dias_extra(
     body: DiaExtraCrear,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: models.Usuario = Depends(solo_admin),
 ):
@@ -1007,6 +1008,8 @@ def otorgar_dias_extra(
         # Índice único (clave, festivo): doble envío al mismo tiempo
         db.rollback()
         raise HTTPException(status_code=409, detail=mensaje_repetido)
+    # Aviso al empleado (solo si tiene MENSAJES), después del commit: nunca rompe el otorgamiento
+    background_tasks.add_task(avisos.dia_extra_otorgado, clave_norm, body.fecha_festivo, body.dias)
     return dias_extra_de(db, clave_norm)
 
 
@@ -1158,6 +1161,7 @@ def _crear_descuento(db: Session, body: DescuentoCrear, usuario: models.Usuario,
 def registrar_aprobacion(
     vacacion_id: int,
     body: AprobacionBody,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: models.Usuario = Depends(solo_admin),
 ):
@@ -1176,6 +1180,12 @@ def registrar_aprobacion(
 
     db.commit()
     db.refresh(vacacion)
+    if body.nivel == "gerencia":
+        # Aviso al empleado (solo si tiene MENSAJES), después del commit: nunca rompe la aprobación
+        background_tasks.add_task(
+            avisos.decision_gerencia, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio,
+            vacacion.fecha_fin, vacacion.dias, bool(body.aprobado), vacacion.id,
+        )
     return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
 
 

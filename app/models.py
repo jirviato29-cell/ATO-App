@@ -1,6 +1,6 @@
 import enum
 from sqlite3.dbapi2 import Timestamp
-from sqlalchemy import BigInteger, Boolean, Column, Date, Float, Integer, JSON, Numeric, String, Text, Enum, DateTime, Time, UniqueConstraint, func, Computed
+from sqlalchemy import BigInteger, Boolean, Column, Date, Float, Integer, JSON, Numeric, String, Text, Enum, DateTime, Time, UniqueConstraint, func, Computed, Uuid
 import sqlalchemy
 from .database import Base
 from datetime import date, datetime, timezone
@@ -976,3 +976,34 @@ class DiaExtra(BaseManual):
     motivo = Column(Text, nullable=False)
     creado_por = Column(Integer)
     creado_at = Column(DateTime(timezone=True))
+
+
+class Aviso(BaseManual):
+    # Avisos automáticos de MENSAJES (los crea app/avisos.py). Tabla hecha a mano en Supabase.
+    # para_clave NULL = bandeja compartida de administración; si no, la clave del empleado.
+    __tablename__ = "avisos"
+
+    id = Column(Integer, primary_key=True)
+    para_clave = Column(String(50))
+    tipo = Column(String(30), nullable=False)
+    texto = Column(Text, nullable=False)
+    enlace = Column(String(100))
+    sobre_clave = Column(String(50))
+    vacacion_id = Column(Integer)  # sin FK: cancelar borra la fila de vacaciones
+    creado_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    leido_at = Column(DateTime(timezone=True))
+    leido_por = Column(Integer)
+
+
+class Mensaje(BaseManual):
+    # Conversación empleado (clave) <-> administración. Tabla hecha a mano en Supabase.
+    __tablename__ = "mensajes"
+
+    id = Column(Integer, primary_key=True)
+    clave = Column(String(50), nullable=False)
+    de_admin = Column(Boolean, nullable=False)
+    autor_id = Column(Integer, nullable=False)  # usuarios.id, sin FK
+    texto = Column(Text, nullable=False)
+    lote = Column(Uuid(as_uuid=False))  # mismo valor en los renglones de un "a todos"
+    creado_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    leido_at = Column(DateTime(timezone=True))  # lo leyó el otro lado
