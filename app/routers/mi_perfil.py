@@ -281,6 +281,9 @@ def pedir_vacaciones(
     db.refresh(vacacion)
     # Aviso a administración, después del commit y fuera de la petición: nunca rompe la solicitud
     background_tasks.add_task(avisos.solicitud_nueva, clave, body.tipo, inicio, fin, dias, vacacion.id)
+    if vacacion.cubre_clave:
+        # Eligió quién la cubre: se le pide confirmar (CONFIRMO / NO PUEDO en su aviso)
+        background_tasks.add_task(avisos.cubrir_solicitud, vacacion.cubre_clave, clave, inicio, fin, vacacion.id)
     return _serializar(vacacion, {})
 
 
@@ -324,7 +327,13 @@ def cancelar_solicitud(
 
     # Datos del aviso ANTES de borrar la fila
     datos_aviso = (vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.dias, vacacion.id)
+    # Quien la iba a cubrir (salvo que ya hubiera dicho que no puede) recibe "Ya no tienes que cubrir..."
+    cubre = vacacion.cubre_clave if vacacion.cubre_confirmado is not False else None
     db.delete(vacacion)
     db.commit()
     background_tasks.add_task(avisos.solicitud_cancelada, *datos_aviso)
+    if cubre:
+        background_tasks.add_task(
+            avisos.cobertura_cancelada, cubre, datos_aviso[0], datos_aviso[2], datos_aviso[3], datos_aviso[5]
+        )
     return {"ok": True}

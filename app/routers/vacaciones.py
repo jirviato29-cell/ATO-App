@@ -47,6 +47,10 @@ class VacacionResponse(BaseModel):
     aprobado_gerencia_por: Optional[str] = None
     aprobado_gerencia_at: Optional[datetime] = None
     cubre_clave: Optional[str] = None
+    # Confirmación de quien cubre: null sin respuesta, true confirmó, false no puede
+    cubre_confirmado: Optional[bool] = None
+    cubre_confirmado_por: Optional[str] = None
+    cubre_confirmado_at: Optional[datetime] = None
 
 
 class SolicitudResponse(VacacionResponse):
@@ -177,6 +181,11 @@ class CubreBody(BaseModel):
     cubre_clave: Optional[str]
 
 
+class ConfirmacionCubreBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmo: bool
+
+
 def _normalizar(clave: Optional[str]) -> str:
     return (clave or "").strip().upper()
 
@@ -202,11 +211,13 @@ def _usuario_activo(db: Session, clave: str) -> Optional[models.Usuario]:
 
 
 def _nombres_aprobadores(db: Session, vacaciones: Iterable[models.Vacacion]) -> Dict[int, str]:
+    vacaciones = list(vacaciones)
     ids = {
         getattr(v, f"aprobado_{nivel}_por")
         for v in vacaciones
         for nivel in NIVELES
-    } - {None}
+    } | {v.cubre_confirmado_por for v in vacaciones}
+    ids -= {None}
     if not ids:
         return {}
     filas = (
@@ -235,6 +246,9 @@ def _serializar(v: models.Vacacion, nombres: Dict[int, str]) -> dict:
         datos[f"aprobado_{nivel}"] = getattr(v, f"aprobado_{nivel}")
         datos[f"aprobado_{nivel}_por"] = nombres.get(por) if por is not None else None
         datos[f"aprobado_{nivel}_at"] = getattr(v, f"aprobado_{nivel}_at")
+    datos["cubre_confirmado"] = v.cubre_confirmado
+    datos["cubre_confirmado_por"] = nombres.get(v.cubre_confirmado_por) if v.cubre_confirmado_por is not None else None
+    datos["cubre_confirmado_at"] = v.cubre_confirmado_at
     return datos
 
 
@@ -1157,6 +1171,32 @@ def _crear_descuento(db: Session, body: DescuentoCrear, usuario: models.Usuario,
     return _serializar(vacacion, {})
 
 
+def es_pendiente_con_aprobacion(v: models.Vacacion) -> bool:
+    return v.tipo in TIPOS_CON_APROBACION and (v.estado or "").strip().lower() == "solicitada"
+
+
+def autorizar_si_completa(v: models.Vacacion) -> bool:
+    """Pasa a 'autorizada' solo con los 4 en verde: RH, Encargado, Gerencia y quien cubre
+    confirmó. Devuelve True si la autorizó en esta llamada. Llamar con la fila bloqueada."""
+    completa = (
+        es_pendiente_con_aprobacion(v)
+        and v.aprobado_rh is True
+        and v.aprobado_encargado is True
+        and v.aprobado_gerencia is True
+        and bool(_normalizar(v.cubre_clave))
+        and v.cubre_confirmado is True
+    )
+    if completa:
+        v.estado = "autorizada"
+    return completa
+
+
+def registrar_respuesta_cubre(v: models.Vacacion, confirmo: bool, usuario_id: int) -> None:
+    v.cubre_confirmado = confirmo
+    v.cubre_confirmado_por = usuario_id
+    v.cubre_confirmado_at = datetime.now(timezone.utc)
+
+
 @router.patch("/{vacacion_id}/aprobacion", response_model=VacacionResponse)
 def registrar_aprobacion(
     vacacion_id: int,
@@ -1172,19 +1212,32 @@ def registrar_aprobacion(
             detail="Solo se pueden aprobar vacaciones en estado solicitada",
         )
 
+    encargado_antes = vacacion.aprobado_encargado
     setattr(vacacion, f"aprobado_{body.nivel}", body.aprobado)
     setattr(vacacion, f"aprobado_{body.nivel}_por", admin.id)
     setattr(vacacion, f"aprobado_{body.nivel}_at", datetime.now(timezone.utc))
-    if body.nivel == "gerencia":
-        vacacion.estado = "autorizada" if body.aprobado else "rechazada"
+    rechazada = body.nivel == "gerencia" and not body.aprobado
+    if rechazada:
+        # Gerencia rechaza: se rechaza de inmediato, como siempre
+        vacacion.estado = "rechazada"
+    # Se autoriza solo con los 4 en verde (RH, Encargado, Gerencia y quien cubre confirmó)
+    autorizada = autorizar_si_completa(vacacion)
 
     db.commit()
     db.refresh(vacacion)
-    if body.nivel == "gerencia":
-        # Aviso al empleado (solo si tiene MENSAJES), después del commit: nunca rompe la aprobación
+    # Avisos después del commit y fuera de la petición: nunca rompen la aprobación
+    if rechazada:
         background_tasks.add_task(
             avisos.decision_gerencia, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio,
-            vacacion.fecha_fin, vacacion.dias, bool(body.aprobado), vacacion.id,
+            vacacion.fecha_fin, vacacion.dias, False, vacacion.id,
+        )
+    if body.nivel == "encargado" and body.aprobado and encargado_antes is not True:
+        background_tasks.add_task(
+            avisos.encargado_aprobo, vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
+        )
+    if autorizada:
+        background_tasks.add_task(
+            avisos.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
         )
     return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
 
@@ -1193,10 +1246,13 @@ def registrar_aprobacion(
 def asignar_cubre(
     vacacion_id: int,
     body: CubreBody,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _admin: models.Usuario = Depends(solo_admin),
 ):
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
+    anterior = _normalizar(vacacion.cubre_clave)
+    confirmado_antes = vacacion.cubre_confirmado
 
     if body.cubre_clave is None:
         vacacion.cubre_clave = None
@@ -1208,8 +1264,72 @@ def asignar_cubre(
             raise HTTPException(status_code=400, detail="La persona no puede cubrirse a si misma")
         vacacion.cubre_clave = usuario.nombre_englobado.strip()
 
+    nuevo = _normalizar(vacacion.cubre_clave)
+    # Pendiente y cambió la persona: se reinicia la confirmación y se avisa a la nueva.
+    # En una ya autorizada (o tomada/rechazada) solo cambia el nombre, como antes.
+    cambio = es_pendiente_con_aprobacion(vacacion) and nuevo != anterior
+    if cambio:
+        vacacion.cubre_confirmado = None
+        vacacion.cubre_confirmado_por = None
+        vacacion.cubre_confirmado_at = None
+
     db.commit()
     db.refresh(vacacion)
+    if cambio:
+        fechas = (vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id)
+        if nuevo:
+            background_tasks.add_task(avisos.cubrir_solicitud, nuevo, *fechas)
+        if anterior and confirmado_antes is True:
+            # Ya había confirmado: que sepa que ya no cubre
+            background_tasks.add_task(avisos.cobertura_cancelada, anterior, *fechas)
+    return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
+
+
+@router.post("/{vacacion_id}/cubre/recordatorio")
+def recordar_cubre(
+    vacacion_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _admin: models.Usuario = Depends(solo_admin),
+):
+    # Vuelve a mandar "¿Confirmas que vas a cubrir...?" (sirve para las solicitudes de antes del flujo)
+    vacacion = _obtener_vacacion(db, vacacion_id)
+    cubre = _normalizar(vacacion.cubre_clave)
+    if not es_pendiente_con_aprobacion(vacacion) or not cubre:
+        raise HTTPException(status_code=409, detail="La solicitud no está pendiente o no tiene quién cubre")
+    if vacacion.cubre_confirmado is not None:
+        raise HTTPException(status_code=409, detail="Quien cubre ya respondió")
+    if cubre not in avisos.claves_con_mensajes(db):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{cubre} todavía no tiene MENSAJES: usa Confirmar por él si ya te confirmó",
+        )
+    background_tasks.add_task(
+        avisos.cubrir_solicitud, cubre, vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
+    )
+    return {"ok": True}
+
+
+@router.patch("/{vacacion_id}/cubre/confirmacion", response_model=VacacionResponse)
+def confirmar_cubre_por_admin(
+    vacacion_id: int,
+    body: ConfirmacionCubreBody,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin: models.Usuario = Depends(solo_admin),
+):
+    # "Confirmar por él": quien cubre avisó por otro medio (teléfono, en persona)
+    vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
+    if not es_pendiente_con_aprobacion(vacacion) or not _normalizar(vacacion.cubre_clave):
+        raise HTTPException(status_code=409, detail="La solicitud no está pendiente o no tiene quién cubre")
+    registrar_respuesta_cubre(vacacion, body.confirmo, admin.id)
+    autorizada = autorizar_si_completa(vacacion)
+    db.commit()
+    db.refresh(vacacion)
+    if autorizada:
+        background_tasks.add_task(
+            avisos.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
+        )
     return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
 
 

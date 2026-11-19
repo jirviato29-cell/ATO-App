@@ -6,6 +6,7 @@ respuesta ya salio), abren su PROPIA sesion y se tragan cualquier error (solo
 queda en el log). Reciben valores planos, nunca objetos del ORM.
 """
 import logging
+import os
 from datetime import date, timedelta
 from typing import List, Optional, Set
 
@@ -17,9 +18,12 @@ from app.database import SessionLocal
 
 log = logging.getLogger("avisos")
 
-# Por ahora MENSAJES es solo para admin y para el piloto de Mi Perfil. Para abrirlo
-# a todos los empleados (asesor/encargado activos), cambiar a True.
-MENSAJES_PARA_TODOS = False
+# Interruptor en Render (variable de entorno MENSAJES_PARA_TODOS=true): abre MENSAJES a todos
+# los empleados (asesor/encargado activos). Apagado por default: solo admin y el piloto de Mi Perfil.
+# Se lee en cada llamada; al cambiar la variable, Render reinicia el servicio.
+def mensajes_para_todos() -> bool:
+    return os.getenv("MENSAJES_PARA_TODOS", "").strip().lower() in ("1", "true", "si", "sí", "yes")
+
 ROLES_EMPLEADO = (models.RolEnum.asesor, models.RolEnum.encargado)
 
 ENLACE_SOLICITUDES = "/mi-perfil?tab=solicitudes"
@@ -48,7 +52,7 @@ def es_admin(usuario: models.Usuario) -> bool:
 def tiene_mensajes(usuario: models.Usuario) -> bool:
     if es_admin(usuario):
         return True
-    if MENSAJES_PARA_TODOS:
+    if mensajes_para_todos():
         return usuario.rol in ROLES_EMPLEADO
     return normalizar(usuario.username) in _usernames_piloto()
 
@@ -56,7 +60,7 @@ def tiene_mensajes(usuario: models.Usuario) -> bool:
 def claves_con_mensajes(db: Session) -> Set[str]:
     # Claves de empleado que hoy pueden ver MENSAJES (destinatarios de "a todos" y de avisos)
     q = db.query(models.Usuario).filter(models.Usuario.activo == True)  # noqa: E712
-    if MENSAJES_PARA_TODOS:
+    if mensajes_para_todos():
         q = q.filter(models.Usuario.rol.in_(ROLES_EMPLEADO))
     else:
         pilotos = _usernames_piloto()
@@ -195,4 +199,96 @@ def dia_extra_otorgado(clave: str, fecha_festivo: date, dias: int) -> None:
             "vacacion_id": None,
         }],
         solo_si_tiene_acceso=clave,
+    )
+
+
+# ------------------- Flujo con cobertura (RH + Encargado + Gerencia + cubre) -------------------
+
+def _del(inicio: date, fin: date) -> str:
+    return f"del {_dm(inicio)}" if inicio == fin else f"del {_dm(inicio)} al {_dm(fin)}"
+
+
+@_seguro
+def encargado_aprobo(clave: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    clave = normalizar(clave)
+    _guardar(
+        [{
+            "para_clave": clave,
+            "tipo": "encargado_aprobo",
+            "texto": f"El encargado aprobó tu solicitud {_del(inicio, fin)}",
+            "enlace": ENLACE_SOLICITUDES,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=clave,
+    )
+
+
+@_seguro
+def cubrir_solicitud(cubre: str, clave: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    # Lleva botones CONFIRMO / NO PUEDO (los resuelve GET /mensajes/avisos); no lleva enlace
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    _guardar(
+        [{
+            "para_clave": cubre,
+            "tipo": "cubrir_solicitud",
+            "texto": f"¿Confirmas que vas a cubrir a {clave} {_del(inicio, fin)}?",
+            "enlace": None,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=cubre,
+    )
+
+
+@_seguro
+def cubre_no_puede(cubre: str, clave: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    _guardar([{
+        "para_clave": None,
+        "tipo": "cubre_no_puede",
+        "texto": f"{cubre} no puede cubrir a {clave} {_del(inicio, fin)}; elige a otra persona",
+        "enlace": ENLACE_SOLICITUDES,
+        "sobre_clave": clave,
+        "vacacion_id": vacacion_id,
+    }])
+
+
+@_seguro
+def solicitud_aprobada(clave: str, tipo: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    # Los 4 en verde: RH, Encargado, Gerencia y quien cubre confirmó
+    clave = normalizar(clave)
+    if tipo == "dia_extra":
+        texto = (
+            f"Tu día extra del {_dm(inicio)} ha sido aprobado" if inicio == fin
+            else f"Tus días extra {_del(inicio, fin)} han sido aprobados"
+        )
+    else:
+        texto = f"Tus vacaciones {_del(inicio, fin)} han sido aprobadas"
+    _guardar(
+        [{
+            "para_clave": clave,
+            "tipo": "solicitud_autorizada",
+            "texto": texto,
+            "enlace": ENLACE_SOLICITUDES,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=clave,
+    )
+
+
+@_seguro
+def cobertura_cancelada(cubre: str, clave: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    _guardar(
+        [{
+            "para_clave": cubre,
+            "tipo": "cobertura_cancelada",
+            "texto": f"Ya no tienes que cubrir a {clave} {_del(inicio, fin)}",
+            "enlace": None,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=cubre,
     )

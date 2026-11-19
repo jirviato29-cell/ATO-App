@@ -955,6 +955,10 @@ class Vacacion(Base):
     aprobado_gerencia_por = Column(Integer)
     aprobado_gerencia_at = Column(DateTime(timezone=True))
     cubre_clave = Column(String(50))  # nombre_englobado de quien cubre
+    # Confirmación de quien cubre (columnas hechas a mano): NULL sin respuesta, true confirmó, false no puede
+    cubre_confirmado = Column(Boolean)
+    cubre_confirmado_por = Column(Integer)  # usuarios.id de quien respondió (quien cubre o un admin)
+    cubre_confirmado_at = Column(DateTime(timezone=True))
 
 
 # Base aparte, FUERA de Base.metadata: el create_all de main.py nunca crea ni

@@ -9,13 +9,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import false, func, or_, select, true
 from sqlalchemy.orm import Session
 
+from app import avisos as avisos_auto
 from app import models
 from app.avisos import clave_de, claves_con_mensajes, es_admin, normalizar, tiene_mensajes
+from app.routers.vacaciones import autorizar_si_completa, es_pendiente_con_aprobacion, registrar_respuesta_cubre
 from app.config import get_current_user
 from app.database import get_db
 
@@ -54,6 +56,13 @@ class NoLeidosResponse(BaseModel):
     total: int
 
 
+class CoberturaAviso(BaseModel):
+    # Botones CONFIRMO / NO PUEDO del aviso "¿Confirmas que vas a cubrir...?"
+    vacacion_id: int
+    puede_responder: bool
+    respuesta: Optional[bool] = None
+
+
 class AvisoResponse(BaseModel):
     id: int
     tipo: str
@@ -62,6 +71,7 @@ class AvisoResponse(BaseModel):
     sobre_clave: Optional[str] = None
     creado_at: Optional[datetime] = None
     leido_at: Optional[datetime] = None
+    cobertura: Optional[CoberturaAviso] = None
 
 
 class MensajeResponse(BaseModel):
@@ -148,7 +158,23 @@ def listar_avisos(
     q = db.query(models.Aviso).filter(_filtro_avisos(usuario))
     if antes_de is not None:
         q = q.filter(models.Aviso.id < antes_de)
-    return q.order_by(models.Aviso.id.desc()).limit(limite).all()
+    filas = q.order_by(models.Aviso.id.desc()).limit(limite).all()
+    # Avisos de cobertura: si todavía puede responder (1 consulta para toda la página)
+    ids = {a.vacacion_id for a in filas if a.tipo == "cubrir_solicitud" and a.vacacion_id}
+    vacs = {v.id: v for v in db.query(models.Vacacion).filter(models.Vacacion.id.in_(ids)).all()} if ids else {}
+    salida = []
+    for a in filas:
+        datos = AvisoResponse.model_validate(a, from_attributes=True).model_dump()
+        if a.tipo == "cubrir_solicitud" and a.vacacion_id:
+            v = vacs.get(a.vacacion_id)
+            sigue = v is not None and normalizar(v.cubre_clave) == normalizar(a.para_clave)
+            datos["cobertura"] = {
+                "vacacion_id": a.vacacion_id,
+                "puede_responder": bool(sigue and es_pendiente_con_aprobacion(v) and v.cubre_confirmado is None),
+                "respuesta": v.cubre_confirmado if sigue else None,
+            }
+        salida.append(datos)
+    return salida
 
 
 @router.post("/avisos/leer-todos")
@@ -364,3 +390,59 @@ def escribir_a_administracion(
     db.commit()
     db.refresh(m)
     return _serializar(m, _autores(db, [m]), para_empleado=True)
+
+
+# ------------------------------- cobertura -------------------------------
+
+class RespuestaCobertura(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmo: bool
+
+
+class CoberturaResponse(BaseModel):
+    vacacion_id: int
+    cubre_confirmado: Optional[bool] = None
+    estado: Optional[str] = None
+
+
+@router.post("/cobertura/{vacacion_id}", response_model=CoberturaResponse)
+def responder_cobertura(
+    vacacion_id: int,
+    body: RespuestaCobertura,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(usuario_mensajes),
+):
+    # Solo responde quien cubre (su clave sale del token), una vez por asignación
+    vacacion = (
+        db.query(models.Vacacion).filter(models.Vacacion.id == vacacion_id).with_for_update().first()
+    )
+    if vacacion is None or es_admin(usuario) or normalizar(vacacion.cubre_clave) != clave_de(usuario):
+        raise HTTPException(status_code=403, detail="No te toca responder esta cobertura")
+    if not es_pendiente_con_aprobacion(vacacion):
+        raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
+    if vacacion.cubre_confirmado is not None:
+        raise HTTPException(status_code=409, detail="Ya respondiste esta cobertura")
+    registrar_respuesta_cubre(vacacion, body.confirmo, usuario.id)
+    autorizada = autorizar_si_completa(vacacion)
+    # El aviso de la pregunta queda leído
+    (
+        db.query(models.Aviso)
+        .filter(
+            models.Aviso.tipo == "cubrir_solicitud",
+            models.Aviso.vacacion_id == vacacion.id,
+            models.Aviso.para_clave == clave_de(usuario),
+            models.Aviso.leido_at.is_(None),
+        )
+        .update({"leido_at": _ahora(), "leido_por": usuario.id}, synchronize_session=False)
+    )
+    db.commit()
+    db.refresh(vacacion)
+    datos = (vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id)
+    if not body.confirmo:
+        background_tasks.add_task(avisos_auto.cubre_no_puede, clave_de(usuario), *datos)
+    if autorizada:
+        background_tasks.add_task(
+            avisos_auto.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
+        )
+    return {"vacacion_id": vacacion.id, "cubre_confirmado": vacacion.cubre_confirmado, "estado": vacacion.estado}
