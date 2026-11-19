@@ -1197,15 +1197,18 @@ def registrar_respuesta_cubre(v: models.Vacacion, confirmo: bool, usuario_id: in
     v.cubre_confirmado_at = datetime.now(timezone.utc)
 
 
-@router.patch("/{vacacion_id}/aprobacion", response_model=VacacionResponse)
-def registrar_aprobacion(
-    vacacion_id: int,
-    body: AprobacionBody,
+def aplicar_aprobacion(
+    db: Session,
+    vacacion: models.Vacacion,
+    nivel: str,
+    aprobado: bool,
+    usuario: models.Usuario,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    admin: models.Usuario = Depends(solo_admin),
-):
-    vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
+) -> None:
+    """Marca un nivel (RH / Encargado / Gerencia), autoriza o rechaza si corresponde y
+    programa los avisos. La usan admin (PATCH /vacaciones/{id}/aprobacion) y quienes
+    revisan (PATCH /aprobaciones/{id}); el permiso se revisa ANTES de llamarla.
+    Llamar con la fila bloqueada (_obtener_vacacion(..., bloquear=True))."""
     if vacacion.tipo not in TIPOS_CON_APROBACION or vacacion.estado != "solicitada":
         raise HTTPException(
             status_code=409,
@@ -1213,10 +1216,10 @@ def registrar_aprobacion(
         )
 
     encargado_antes = vacacion.aprobado_encargado
-    setattr(vacacion, f"aprobado_{body.nivel}", body.aprobado)
-    setattr(vacacion, f"aprobado_{body.nivel}_por", admin.id)
-    setattr(vacacion, f"aprobado_{body.nivel}_at", datetime.now(timezone.utc))
-    rechazada = body.nivel == "gerencia" and not body.aprobado
+    setattr(vacacion, f"aprobado_{nivel}", aprobado)
+    setattr(vacacion, f"aprobado_{nivel}_por", usuario.id)
+    setattr(vacacion, f"aprobado_{nivel}_at", datetime.now(timezone.utc))
+    rechazada = nivel == "gerencia" and not aprobado
     if rechazada:
         # Gerencia rechaza: se rechaza de inmediato, como siempre
         vacacion.estado = "rechazada"
@@ -1231,7 +1234,7 @@ def registrar_aprobacion(
             avisos.decision_gerencia, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio,
             vacacion.fecha_fin, vacacion.dias, False, vacacion.id,
         )
-    if body.nivel == "encargado" and body.aprobado and encargado_antes is not True:
+    if nivel == "encargado" and aprobado and encargado_antes is not True:
         background_tasks.add_task(
             avisos.encargado_aprobo, vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
         )
@@ -1239,6 +1242,18 @@ def registrar_aprobacion(
         background_tasks.add_task(
             avisos.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
         )
+
+
+@router.patch("/{vacacion_id}/aprobacion", response_model=VacacionResponse)
+def registrar_aprobacion(
+    vacacion_id: int,
+    body: AprobacionBody,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin: models.Usuario = Depends(solo_admin),
+):
+    vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
+    aplicar_aprobacion(db, vacacion, body.nivel, body.aprobado, admin, background_tasks)
     return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
 
 

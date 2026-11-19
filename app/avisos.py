@@ -27,6 +27,8 @@ def mensajes_para_todos() -> bool:
 ROLES_EMPLEADO = (models.RolEnum.asesor, models.RolEnum.encargado)
 
 ENLACE_SOLICITUDES = "/mi-perfil?tab=solicitudes"
+# Pantalla de RH y encargados (columna RH / Encargado)
+ENLACE_REVISAR = "/revisar-solicitudes"
 
 
 def normalizar(clave: Optional[str]) -> str:
@@ -49,25 +51,37 @@ def es_admin(usuario: models.Usuario) -> bool:
     return usuario.rol == models.RolEnum.admin
 
 
-def tiene_mensajes(usuario: models.Usuario) -> bool:
+def tiene_mensajes(usuario: models.Usuario, db: Optional[Session] = None) -> bool:
     if es_admin(usuario):
         return True
     if mensajes_para_todos():
-        return usuario.rol in ROLES_EMPLEADO
-    return normalizar(usuario.username) in _usernames_piloto()
+        if usuario.rol in ROLES_EMPLEADO:
+            return True
+    elif normalizar(usuario.username) in _usernames_piloto():
+        return True
+    # RH y encargados (incluidas asignaciones manuales) tienen MENSAJES siempre:
+    # ahí les llegan las solicitudes que revisan.
+    if db is not None:
+        from app.permisos_vacaciones import es_revisor
+
+        return es_revisor(db, usuario)
+    return False
 
 
 def claves_con_mensajes(db: Session) -> Set[str]:
     # Claves de empleado que hoy pueden ver MENSAJES (destinatarios de "a todos" y de avisos)
+    from app.permisos_vacaciones import claves_revisoras
+
+    revisores = claves_revisoras(db)
     q = db.query(models.Usuario).filter(models.Usuario.activo == True)  # noqa: E712
     if mensajes_para_todos():
         q = q.filter(models.Usuario.rol.in_(ROLES_EMPLEADO))
     else:
         pilotos = _usernames_piloto()
         if not pilotos:
-            return set()
+            return revisores
         q = q.filter(func.upper(func.trim(models.Usuario.username)).in_(pilotos))
-    return {c for c in (clave_de(u) for u in q.all() if not es_admin(u)) if c}
+    return {c for c in (clave_de(u) for u in q.all() if not es_admin(u)) if c} | revisores
 
 
 # ------------------------------- textos -------------------------------
@@ -128,32 +142,62 @@ def _seguro(fn):
     return envuelta
 
 
+def _guardar_con_revisores(fila_admin: dict) -> None:
+    """La fila de administración (igual que siempre) + una copia personal para RH y para el
+    encargado del módulo del empleado, con enlace a su pantalla. Si calcular a quién le toca
+    falla, la fila de administración se guarda de todos modos."""
+    db = SessionLocal()
+    try:
+        filas = [fila_admin]
+        try:
+            from app.permisos_vacaciones import revisores_de
+
+            for clave in revisores_de(db, fila_admin["sobre_clave"]):
+                filas.append({**fila_admin, "para_clave": clave, "enlace": ENLACE_REVISAR})
+        except Exception:
+            log.exception("No se pudo calcular RH/encargado del aviso; solo va a administración")
+            db.rollback()
+        db.add_all(models.Aviso(**f) for f in filas)
+        db.commit()
+    except Exception:
+        log.exception("No se pudo crear el aviso (la operación principal ya quedó guardada)")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 # --------------------------- avisos públicos ---------------------------
 
 @_seguro
 def solicitud_nueva(clave: str, tipo: str, inicio: date, fin: date, dias, vacacion_id: int) -> None:
     clave = normalizar(clave)
-    _guardar([{
+    _guardar_con_revisores({
         "para_clave": None,
         "tipo": "solicitud_nueva",
         "texto": f"{clave} solicitó {_que(tipo)} {_fechas(inicio, fin, dias)}",
         "enlace": ENLACE_SOLICITUDES,
         "sobre_clave": clave,
         "vacacion_id": vacacion_id,
-    }])
+    })
 
 
 @_seguro
 def solicitud_cancelada(clave: str, tipo: str, inicio: date, fin: date, dias, vacacion_id: int) -> None:
     clave = normalizar(clave)
-    _guardar([{
+    _guardar_con_revisores({
         "para_clave": None,
         "tipo": "solicitud_cancelada",
         "texto": f"{clave} canceló su solicitud de {_que(tipo)} {_fechas(inicio, fin, dias)}",
         "enlace": ENLACE_SOLICITUDES,
         "sobre_clave": clave,
         "vacacion_id": vacacion_id,
-    }])
+    })
 
 
 @_seguro

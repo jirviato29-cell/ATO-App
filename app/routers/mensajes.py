@@ -15,7 +15,7 @@ from sqlalchemy import false, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app import avisos as avisos_auto
-from app import models
+from app import models, permisos_vacaciones
 from app.avisos import clave_de, claves_con_mensajes, es_admin, normalizar, tiene_mensajes
 from app.routers.vacaciones import autorizar_si_completa, es_pendiente_con_aprobacion, registrar_respuesta_cubre
 from app.config import get_current_user
@@ -28,8 +28,11 @@ LIMITE_MAXIMO = 100
 TEXTO_MAXIMO = 2000
 
 
-def usuario_mensajes(usuario: models.Usuario = Depends(get_current_user)) -> models.Usuario:
-    if not tiene_mensajes(usuario):
+def usuario_mensajes(
+    usuario: models.Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> models.Usuario:
+    if not tiene_mensajes(usuario, db):
         raise HTTPException(status_code=403, detail="MENSAJES todavía no está disponible para tu usuario")
     return usuario
 
@@ -54,6 +57,8 @@ class NoLeidosResponse(BaseModel):
     avisos: int
     mensajes: int
     total: int
+    # Solo RH y encargados: solicitudes donde les falta marcar su columna (null = no revisa)
+    por_revisar: Optional[int] = None
 
 
 class CoberturaAviso(BaseModel):
@@ -116,7 +121,8 @@ def _ahora() -> datetime:
 
 # ------------------------------- contador -------------------------------
 
-@router.get("/no-leidos", response_model=NoLeidosResponse)
+# exclude_none: para quien no revisa, la respuesta queda igual que antes (sin por_revisar)
+@router.get("/no-leidos", response_model=NoLeidosResponse, response_model_exclude_none=True)
 def no_leidos(
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(usuario_mensajes),
@@ -137,7 +143,12 @@ def no_leidos(
         )
     ).one()
     avisos, mensajes = int(fila[0] or 0), int(fila[1] or 0)
-    return {"avisos": avisos, "mensajes": mensajes, "total": avisos + mensajes}
+    respuesta = {"avisos": avisos, "mensajes": mensajes, "total": avisos + mensajes}
+    if not es_admin(usuario):
+        alcance = permisos_vacaciones.alcance(db, usuario)
+        if alcance.es_revisor:
+            respuesta["por_revisar"] = permisos_vacaciones.contar_por_revisar(db, alcance)
+    return respuesta
 
 
 # ------------------------------- avisos -------------------------------
