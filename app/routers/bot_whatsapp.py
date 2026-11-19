@@ -184,6 +184,7 @@ def _historial_para_claude(db, conv_id: int) -> list:
             SELECT autor, texto FROM (
                 SELECT id, autor, texto FROM bot_mensajes
                 WHERE conversacion_id = :c AND texto IS NOT NULL AND texto <> ''
+                  AND (direccion = 'entrante' OR estado_envio IS NULL OR estado_envio NOT LIKE 'error%')
                 ORDER BY id DESC LIMIT :n
             ) t ORDER BY id ASC
         """),
