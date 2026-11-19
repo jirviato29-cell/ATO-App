@@ -8,14 +8,18 @@ from sqlalchemy.orm import Session
 from app import avisos, models
 from app.config import get_current_user
 from app.database import get_db
+from app.permisos_vacaciones import mapa_encargados
 from app.routers.vacaciones import (
+    ESTADOS_VIGENTES,
     ZONA_MX,
     DiasExtraResponse,
     SaldoResponse,
     VacacionResponse,
     _clave_columna,
+    _cuentas_por_clave,
     _nombres_aprobadores,
     _normalizar,
+    _principal,
     _serializar,
     _texto_fecha,
     _usuario_activo,
@@ -187,6 +191,94 @@ def mis_dias_extra(
     return dias_extra_de(db, englobado)
 
 
+# ------------------- ¿Quién te cubre? (lista para elegir) -------------------
+# Por persona (nombre_englobado) y su cuenta PRINCIPAL, igual que saldo y permisos:
+# - Módulo con encargado: la gente de TODOS los módulos de su(s) encargado(s)
+#   (ej. M1 -> A48-ZURY tiene M1 y VL -> salen los de M1 y VL). Cadenas C. tiene a
+#   A57-ELI por asignación manual, así que salen solo los promotores de Cadenas C.
+# - Módulo sin encargado (BO es del admin): la gente de ese mismo módulo.
+# - Sin módulo: lista vacía (solo "No tengo quién me cubra" en el frontend).
+# Nunca la propia persona, ni inactivos, ni quien tenga vacaciones o día extra
+# (solicitada, autorizada o tomada) que se encime con esas fechas.
+TIPOS_QUE_OCUPAN = ("vacaciones", "dia_extra")
+
+
+class CubreOpcion(BaseModel):
+    clave: str
+    nombre: Optional[str] = None
+
+
+def _modulos_para_cubrir(db: Session, modulo: Optional[int]) -> set:
+    if modulo is None:
+        return set()
+    modulos = set()
+    for de_encargado in mapa_encargados(db).values():
+        if modulo in de_encargado:
+            modulos |= de_encargado
+    return modulos or {modulo}
+
+
+def opciones_cubre(db: Session, clave_norm: str, inicio: date, fin: date) -> List[dict]:
+    clave_norm = _normalizar(clave_norm)
+    if not clave_norm:
+        return []
+    mia = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
+    modulos = _modulos_para_cubrir(db, mia.modulo_id if mia is not None else None)
+    if not modulos:
+        return []
+
+    # Candidatas: alguna cuenta activa de empleado en esos módulos; luego se revisa su principal
+    claves = {
+        _normalizar(f[0])
+        for f in db.query(models.Usuario.nombre_englobado)
+        .filter(
+            models.Usuario.activo == True,  # noqa: E712
+            models.Usuario.rol.in_(ROLES_EMPLEADO),
+            models.Usuario.modulo_id.in_(modulos),
+        )
+        .all()
+    }
+    claves.discard("")
+    claves.discard(clave_norm)
+    if not claves:
+        return []
+
+    ocupadas = {
+        _normalizar(v.clave)
+        for v in db.query(models.Vacacion)
+        .filter(
+            _clave_columna(models.Vacacion.clave).in_(claves),
+            models.Vacacion.tipo.in_(TIPOS_QUE_OCUPAN),
+            models.Vacacion.fecha_inicio <= fin,
+            models.Vacacion.fecha_fin >= inicio,
+        )
+        .all()
+        if (v.estado or "").strip().lower() in ESTADOS_VIGENTES
+    }
+
+    opciones = []
+    for clave, cuentas in _cuentas_por_clave(db, claves - ocupadas).items():
+        principal = _principal(cuentas)
+        if principal is None or principal.rol not in ROLES_EMPLEADO or principal.modulo_id not in modulos:
+            continue
+        nombre = next((c.nombre_completo.strip() for c in cuentas if (c.nombre_completo or "").strip()), None)
+        opciones.append({"clave": (principal.nombre_englobado or "").strip() or clave, "nombre": nombre})
+    return sorted(opciones, key=lambda o: _normalizar(o["clave"]))
+
+
+@router.get("/cubre-opciones", response_model=List[CubreOpcion])
+def cubre_opciones(
+    inicio: date,
+    fin: date,
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(get_current_user),
+):
+    _exigir_piloto(usuario)
+    if fin < inicio:
+        raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
+    return opciones_cubre(db, _normalizar(usuario.nombre_englobado), inicio, fin)
+
+
 @router.post("/vacaciones", response_model=VacacionResponse, status_code=201)
 def pedir_vacaciones(
     body: SolicitudVacacion,
@@ -231,11 +323,11 @@ def pedir_vacaciones(
 
     cubre = None
     if (body.cubre_clave or "").strip():
-        cubre = _usuario_activo(db, body.cubre_clave)
+        # Solo alguien de la lista de GET /mi-perfil/cubre-opciones para estas mismas fechas
+        permitidas = {_normalizar(o["clave"]) for o in opciones_cubre(db, clave_norm, inicio, fin)}
+        cubre = _usuario_activo(db, body.cubre_clave) if _normalizar(body.cubre_clave) in permitidas else None
         if cubre is None:
-            raise HTTPException(status_code=400, detail="La persona que cubre no corresponde a un usuario activo")
-        if _normalizar(cubre.nombre_englobado) == clave_norm:
-            raise HTTPException(status_code=400, detail="No puedes cubrirte a ti misma(o)")
+            raise HTTPException(status_code=400, detail="Esa persona no puede cubrirte")
 
     # Mismo candado que POST /vacaciones: sin esto, un doble envio pasaria las validaciones dos veces.
     candado_persona(db, clave_norm)
