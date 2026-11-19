@@ -204,8 +204,42 @@ def _historial_para_claude(db, conv_id: int) -> list:
     return mensajes
 
 
-def _prompt_sistema(cfg: dict, paso: int, datos: dict) -> str:
+def _equipos_en_existencia(db) -> str:
+    """Telefonos TELCEL disponibles hoy (por IMEI), con su precio de contado del sistema."""
+    try:
+        filas = db.execute(text("""
+            SELECT e.producto, COUNT(*) AS piezas, MAX(g.precio) AS precio
+            FROM equipos_telcel e
+            LEFT JOIN inventario_general g ON UPPER(TRIM(g.clave)) = UPPER(TRIM(e.clave))
+            WHERE e.estatus IN ('surtido', 'en_bodega')
+              AND UPPER(e.producto) LIKE 'TELEFONO TELCEL%'
+            GROUP BY e.producto
+            ORDER BY e.producto
+        """)).fetchall()
+    except Exception:
+        db.rollback()
+        log.exception("[bot-whatsapp] No se pudo leer el inventario de equipos")
+        return ""
+    lineas = []
+    for producto, piezas, precio in filas:
+        nombre = producto.upper().replace("TELEFONO TELCEL", "").strip()
+        precio_txt = f"${float(precio):,.0f}" if precio else "precio por confirmar"
+        lineas.append(f"- {nombre}: contado {precio_txt}")
+    return "\n".join(lineas)
+
+
+def _prompt_sistema(cfg: dict, paso: int, datos: dict, equipos: str = "") -> str:
     partes = [PROMPT_BASE]
+    if equipos:
+        partes.append(
+            "## Equipos Telcel en existencia hoy (inventario real de ATO)\n"
+            "Solo ofrece equipos de esta lista. Si preguntan por uno que no está, di que por ahora no lo tenemos y ofrece uno parecido de la lista.\n"
+            "- Precio de contado: dalo SOLO si el cliente pregunta por contado o por cuánto cuesta el equipo de contado.\n"
+            "- En plan: el pago inicial y la mensualidad dependen de la evaluación de Telcel; no des cifras, se las manda el asesor en su cotización.\n"
+            "- Colores: no los tenemos en sistema; dile que el asesor le confirma colores disponibles.\n"
+            "- También se pueden llevar en abonos con Paguitos o PayJoy en nuestros módulos.\n"
+            + equipos
+        )
     if cfg.get("ofertas"):
         partes.append("## Ofertas vigentes (úsalas tal cual, no inventes otras)\n" + cfg["ofertas"])
     if cfg.get("preguntas_frecuentes"):
@@ -220,7 +254,8 @@ def _prompt_sistema(cfg: dict, paso: int, datos: dict) -> str:
     return "\n\n".join(partes)
 
 
-def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict) -> Optional[dict]:
+def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict,
+                             equipos: str = "") -> Optional[dict]:
     api_key = _env("BOT_ANTHROPIC_API_KEY") or _env("ANTHROPIC_API_KEY")
     if not api_key:
         log.error("Falta BOT_ANTHROPIC_API_KEY")
@@ -229,7 +264,7 @@ def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict)
     resp = cliente.messages.create(
         model=cfg.get("modelo") or MODELO_DEFAULT,
         max_tokens=1000,
-        system=_prompt_sistema(cfg, paso, datos),
+        system=_prompt_sistema(cfg, paso, datos, equipos),
         tools=[TOOL_RESPONDER],
         tool_choice={"type": "tool", "name": "responder"},
         messages=historial,
@@ -329,7 +364,8 @@ def responder_si_toca(msg_id: int, wa_message_id: str) -> None:
         if not historial:
             return
 
-        resultado = pedir_respuesta_a_claude(cfg, historial, fila["paso"], datos)
+        equipos = _equipos_en_existencia(db)
+        resultado = pedir_respuesta_a_claude(cfg, historial, fila["paso"], datos, equipos)
         if not resultado:
             return
 
