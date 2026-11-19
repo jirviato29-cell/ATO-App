@@ -19,6 +19,7 @@ from app.routers import mi_perfil
 from app.routers import promociones
 from app.routers import bot_whatsapp
 from app.routers import bot_chats
+from app.routers import bot_catalogo
 from app.routers import mensajes
 from app.routers import aprobaciones
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,5 +85,6 @@ app.include_router(mi_perfil.router, prefix="/mi-perfil", tags=["Mi Perfil"])
 app.include_router(promociones.router, prefix="/promociones", tags=["Promociones"])
 app.include_router(bot_whatsapp.router, prefix="/bot-whatsapp", tags=["Bot WhatsApp"])
 app.include_router(bot_chats.router, prefix="/bot-whatsapp/admin", tags=["Bot WhatsApp admin"])
+app.include_router(bot_catalogo.router, prefix="/bot-whatsapp/catalogo", tags=["Catálogo WhatsApp"])
 app.include_router(mensajes.router, prefix="/mensajes", tags=["Mensajes"])
 app.include_router(aprobaciones.router, prefix="/aprobaciones", tags=["Aprobaciones"])
