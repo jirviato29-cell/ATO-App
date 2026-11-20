@@ -1,3 +1,4 @@
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
@@ -144,8 +145,15 @@ def mi_saldo(
 
 
 # ------------------- Solicitudes de vacaciones (piloto) -------------------
-# Por ahora solo los usernames de esta lista pueden pedir o cancelar vacaciones.
+# Con VACACIONES_PARA_TODOS apagado, solo los usernames de esta lista pueden pedir o cancelar vacaciones.
 PILOTO_MI_PERFIL = ("A55BO-EVELYN",)
+
+
+# Interruptor en Render (variable de entorno VACACIONES_PARA_TODOS=true): abre Mis vacaciones
+# a todos los empleados (asesor/encargado activos). Apagado por default: solo el piloto.
+# Se lee en cada llamada, igual que MENSAJES_PARA_TODOS (app/avisos.py).
+def vacaciones_para_todos() -> bool:
+    return os.getenv("VACACIONES_PARA_TODOS", "").strip().lower() in ("1", "true", "si", "sí", "yes")
 
 # Igual que el calendario del frontend: primer dia elegible = hoy (Mexico) + 31.
 # Las demas reglas (maximo de dias, bloqueos, uno por mes, 15 dias, saldo) son las
@@ -174,9 +182,25 @@ def _es_piloto(usuario: models.Usuario) -> bool:
     return _normalizar(usuario.username) in {_normalizar(u) for u in PILOTO_MI_PERFIL}
 
 
+def tiene_mis_vacaciones(usuario: models.Usuario) -> bool:
+    if _es_piloto(usuario):
+        return True
+    return vacaciones_para_todos() and bool(usuario.activo) and usuario.rol in ROLES_EMPLEADO
+
+
 def _exigir_piloto(usuario: models.Usuario) -> None:
-    if not _es_piloto(usuario):
+    if not tiene_mis_vacaciones(usuario):
         raise HTTPException(status_code=403, detail="Esta función todavía no está disponible para tu usuario")
+
+
+class AccesoResponse(BaseModel):
+    mis_vacaciones: bool
+
+
+@router.get("/acceso", response_model=AccesoResponse)
+def mi_acceso(usuario: models.Usuario = Depends(get_current_user)):
+    # El frontend pregunta aquí si muestra "MIS VACACIONES": así manda el interruptor de Render
+    return {"mis_vacaciones": tiene_mis_vacaciones(usuario)}
 
 
 @router.get("/dias-extra", response_model=DiasExtraResponse)
