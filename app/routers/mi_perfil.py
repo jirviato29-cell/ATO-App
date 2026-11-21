@@ -26,7 +26,6 @@ from app.routers.vacaciones import (
     _usuario_activo,
     candado_persona,
     dias_extra_de,
-    festivos_de,
     periodos_guardados,
     saldo_actual_y_siguiente,
     validar_contra_periodos,
@@ -173,6 +172,8 @@ class SolicitudVacacion(BaseModel):
     dias: Optional[int] = None
     # Opcional: si no lo pone la persona, admin lo asigna con PATCH /vacaciones/{id}/cubre
     cubre_clave: Optional[str] = Field(None, max_length=50)
+    # La persona eligió "No tengo quién me cubra". El día extra exige cubre_clave o esto.
+    sin_cubre: bool = False
     nota: Optional[str] = Field(None, max_length=500)
     # "dia_extra": día de descanso extra (no sale del saldo de vacaciones)
     tipo: Literal["vacaciones", "dia_extra"] = "vacaciones"
@@ -330,8 +331,13 @@ def pedir_vacaciones(
     hoy = datetime.now(ZONA_MX).date()
     es_extra = body.tipo == "dia_extra"
     if es_extra:
-        # Ventana especial del festivo (sin anticipación) o 20 días; bloqueos siempre
-        validar_fechas_dia_extra_empleado(inicio, fin, hoy, festivos_de(db, clave_norm))
+        # 5 días de anticipación, cualquier día de la semana, sin 15 dic - 6 ene
+        validar_fechas_dia_extra_empleado(inicio, fin, hoy)
+        if not (body.cubre_clave or "").strip() and not body.sin_cubre:
+            raise HTTPException(
+                status_code=400,
+                detail="Elige quién te cubre (o \"No tengo quién me cubra\")",
+            )
     else:
         primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION)
         if inicio < primer_dia:

@@ -924,25 +924,17 @@ def periodos_guardados(db: Session, clave_norm: str) -> List[models.Vacacion]:
 # ni cuentan para "uno por mes" o los 15 días; sí para empalme y para el máximo
 # de 6 días seguidos junto con vacaciones.
 
-# Empleado fuera de una ventana especial: 20 días de anticipación. Mismo criterio
-# que vacaciones ("30 días" = primer día elegible hoy + 31): primer día = hoy + 21.
-DIAS_ANTICIPACION_EXTRA = 21
+# Empleado: el día extra se pide con 5 días de anticipación (primer día = hoy + 5),
+# cualquier día de la semana, y nunca del 15 de diciembre al 6 de enero (cada año).
+DIAS_ANTICIPACION_EXTRA = 5
 
-# Ventanas especiales por festivo: dentro de ellas el empleado pide sin anticipación
-# (desde mañana). Para otro festivo, agregar otra entrada.
-VENTANAS_DIA_EXTRA = (
-    {
-        "fecha_festivo": date(2026, 11, 16),
-        "inicio": date(2026, 11, 19),
-        "fin": date(2026, 12, 4),
-        "solo_entre_semana": True,
-    },
-)
+
+def dia_extra_bloqueado(d: date) -> bool:
+    return (d.month == 12 and d.day >= 15) or (d.month == 1 and d.day <= 6)
+
 
 # Tipos que se suman para el máximo de días seguidos
 TIPOS_SEGUIDOS = ("vacaciones", "dia_extra")
-
-_DIAS_SEMANA = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 
 
 def _rango(inicio: date, fin: date) -> List[date]:
@@ -1070,10 +1062,6 @@ def dias_extra_de(db: Session, clave: str) -> dict:
     return {"clave": clave_norm, **resumen}
 
 
-def festivos_de(db: Session, clave_norm: str) -> List[date]:
-    return [o.fecha_festivo for o in _otorgados(db, [clave_norm]).get(clave_norm, [])]
-
-
 def validar_dias_extra(
     db: Session, clave_norm: str, existentes: List[models.Vacacion], inicio: date, fin: date, tu: bool
 ) -> None:
@@ -1106,48 +1094,23 @@ def validar_dias_extra(
     )
 
 
-def ventana_dia_extra(d: date, festivos: Iterable[date]) -> Optional[dict]:
-    festivos = set(festivos)
-    return next(
-        (v for v in VENTANAS_DIA_EXTRA if v["fecha_festivo"] in festivos and v["inicio"] <= d <= v["fin"]),
-        None,
-    )
-
-
-def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date, festivos: Iterable[date]) -> None:
-    """Empleado: dentro de una ventana especial de su festivo, sin anticipación (desde mañana)
-    y, si la ventana lo pide, solo lunes a viernes; fuera de ella, 20 días de anticipación.
-    Las fechas bloqueadas aplican siempre."""
-    festivos = list(festivos)
+def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date) -> None:
+    """Empleado: 5 días de anticipación, de lunes a domingo, sin 15 dic - 6 ene.
+    La vigencia (festivo a vencimiento) la revisa validar_dias_extra."""
     primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION_EXTRA)
+    if inicio < primer_dia:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Los días extra se piden con {DIAS_ANTICIPACION_EXTRA} días de anticipación: "
+                f"puedes pedir a partir del {_texto_fecha(primer_dia)}"
+            ),
+        )
     for d in _rango(inicio, fin):
-        if _dia_bloqueado(d):
+        if dia_extra_bloqueado(d):
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"El {_texto_fecha(d)} está en periodo de ventas (7 dic - 7 ene o 13 - 16 nov): "
-                    f"no se pueden pedir días extra"
-                ),
-            )
-        ventana = ventana_dia_extra(d, festivos)
-        if ventana:
-            if d <= hoy:
-                raise HTTPException(status_code=400, detail="Los días extra se piden a partir de mañana")
-            if ventana["solo_entre_semana"] and d.weekday() >= 5:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Del {_texto_fecha(ventana['inicio'])} al {_texto_fecha(ventana['fin'])} el día extra "
-                        f"solo se puede de lunes a viernes: el {_texto_fecha(d)} es {_DIAS_SEMANA[d.weekday()]}"
-                    ),
-                )
-        elif d < primer_dia:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Los días extra se piden con 20 días de anticipación: "
-                    f"puedes pedir a partir del {_texto_fecha(primer_dia)}"
-                ),
+                detail=f"El {_texto_fecha(d)} está bloqueado (15 dic - 6 ene): no se pueden pedir días extra",
             )
 
 
@@ -1294,7 +1257,7 @@ def crear_vacacion(
     if es_vacacion:
         validar_fechas_vacaciones(body.fecha_inicio, body.fecha_fin, tu=False)
     if es_extra:
-        # Admin: cualquier fecha (sin anticipación, ventana ni bloqueos), días enteros
+        # Admin: cualquier fecha dentro de la vigencia (sin anticipación ni bloqueos), días enteros
         validar_dias_enteros(body.fecha_inicio, body.fecha_fin, body.dias)
 
     candado_persona(db, clave_norm)
