@@ -334,13 +334,26 @@ _SALDO_VACIO = {
 }
 
 
-def _dias_lft(anios: int) -> int:
-    # LFT: 1=12, 2=14, 3=16, 4=18, 5=20; de ahi +2 cada 5 anios (6-10=22, 11-15=24, ...)
+# Reforma "vacaciones dignas": la tabla nueva aplica a aniversarios desde el 01/01/2023
+REFORMA_LFT = date(2023, 1, 1)
+
+
+def _dias_lft(anios: int, aniversario: date) -> int:
+    """Dias que tocan por LFT segun la tabla vigente en la FECHA DE ANIVERSARIO del ciclo.
+
+    Unica funcion para los dias de un ciclo (saldo, solicitudes y panel).
+    - Desde 01/01/2023: 1=12, 2=14, 3=16, 4=18, 5=20; de ahi +2 cada 5 anios (6-10=22, 11-15=24, 16-20=26, ...)
+    - Antes:            1=6, 2=8, 3=10, 4=12; 5-9=14, 10-14=16, 15-19=18, 20-24=20, 25-29=22 (+2 cada 5 anios)
+    """
     if anios <= 0:
         return 0
-    if anios <= 5:
-        return 10 + 2 * anios
-    return 20 + 2 * math.ceil((anios - 5) / 5)
+    if aniversario >= REFORMA_LFT:
+        if anios <= 5:
+            return 10 + 2 * anios
+        return 20 + 2 * math.ceil((anios - 5) / 5)
+    if anios <= 4:
+        return 4 + 2 * anios
+    return 14 + 2 * ((anios - 5) // 5)
 
 
 def _aniversario(ingreso: date, anio: int) -> date:
@@ -432,7 +445,7 @@ def _calcular_saldo(
     anios = max(0, fecha.year - ingreso.year - (1 if _aniversario(ingreso, fecha.year) > fecha else 0))
     ciclo_inicio = _aniversario(ingreso, ingreso.year + anios)
     ciclo_fin = _aniversario(ingreso, ingreso.year + anios + 1) - timedelta(days=1)
-    corresponden = _dias_lft(anios)
+    corresponden = _dias_lft(anios, ciclo_inicio)
     if _solo_fin_de_semana(principal.horario_semanal):
         corresponden = math.ceil(corresponden / 3)
 
