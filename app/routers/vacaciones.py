@@ -1,3 +1,4 @@
+import calendar
 import math
 import unicodedata
 from typing import Annotated, Dict, Iterable, List, Literal, Optional, Union
@@ -71,9 +72,26 @@ class SaldoAnio(BaseModel):
     dias_corresponden: int
     ciclo_inicio: date
     ciclo_fin: date
+    # Ultimo dia para tomarlos: aniversario + 18 meses - 1 dia (null en el año 0)
+    caduca: Optional[date] = None
+    # Reparto FIFO: lo que salio de ESTE año, aunque se haya tomado en otra fecha
     dias_usados: float
     dias_solicitados_pendientes: float
     dias_quedan: float
+
+
+class AsignacionPeriodo(BaseModel):
+    id: int  # vacacion
+    dias: float  # dias de ese periodo que salen de este año
+
+
+class AnioVacaciones(SaldoAnio):
+    dias_tomados: float
+    dias_descuentos: float
+    dias_adelanto: float  # parte de dias_tomados que se tomo antes de ganar el año
+    vigente: bool  # ciclo_inicio <= hoy <= caduca
+    caducado: bool
+    periodos: List[AsignacionPeriodo] = []
 
 
 class SaldoResponse(BaseModel):
@@ -81,6 +99,11 @@ class SaldoResponse(BaseModel):
     # null si la persona no tiene fecha de ingreso
     actual: Optional[SaldoAnio] = None
     siguiente: Optional[SaldoAnio] = None
+    # Del año 1 al siguiente, con su caducidad y el reparto de cada periodo
+    anios: List[AnioVacaciones] = []
+    # Hoy, entre los años vigentes: lo que le queda y lo que aun puede pedir (sin lo solicitado)
+    total_quedan: Optional[float] = None
+    total_disponibles: Optional[float] = None
 
 
 class CicloPanel(BaseModel):
@@ -93,7 +116,9 @@ class CicloPanel(BaseModel):
     dias_descuentos: float
     dias_solicitados_pendientes: float
     dias_quedan: float
-    # Solo ciclos cerrados: lo que no se uso se pierde (no se acumula)
+    caduca: Optional[date] = None
+    dias_adelanto: float = 0
+    # Solo ciclos cerrados y ya caducados (18 meses): lo que no se uso se pierde
     dias_perdidos: Optional[float] = None
 
 
@@ -430,66 +455,222 @@ def _principal(cuentas: List[models.Usuario]) -> Optional[models.Usuario]:
     return next((c for c in cuentas if (c.sueldo_base or 0) > 0), cuentas[0])
 
 
+# Vigencia de cada año de vacaciones (LFT arts. 81 y 516): del aniversario al
+# aniversario + 18 meses - 1 dia. Despues caduca. Con 18 meses nunca hay mas de
+# 2 años vigentes a la vez (el atrasado y el actual).
+MESES_VIGENCIA = 18
+_CERO = 1e-9
+
+
+def _caducidad(aniversario: date) -> date:
+    # Si el dia no existe en ese mes (p. ej. 31 -> febrero), se toma el ultimo del mes
+    meses = aniversario.month - 1 + MESES_VIGENCIA
+    anio = aniversario.year + meses // 12
+    mes = meses % 12 + 1
+    dia = min(aniversario.day, calendar.monthrange(anio, mes)[1])
+    return date(anio, mes, dia) - timedelta(days=1)
+
+
+def _anios_cumplidos(ingreso: date, fecha: date) -> int:
+    # Antes de la fecha de ingreso cuenta como año 0
+    return max(0, fecha.year - ingreso.year - (1 if _aniversario(ingreso, fecha.year) > fecha else 0))
+
+
+def _estado(v: models.Vacacion) -> str:
+    return (v.estado or "").strip().lower()
+
+
+class _Reparto:
+    """Reparte los dias usados entre los años de vacaciones (FIFO).
+
+    - Cada dia de vacaciones (autorizada/tomada) sale del año MAS VIEJO que ya se gano,
+      no ha caducado y tiene dias, en la fecha_inicio del periodo.
+    - Si no hay ninguno, es adelanto: sale del siguiente año que se va a ganar (con dias).
+    - Un descuento sale del año que empieza en su fecha (se fecha en el aniversario).
+    - Las solicitadas se reparten igual, despues de todo lo firme (no le quitan dias a lo firme).
+    """
+
+    def __init__(self, principal: models.Usuario, periodos: List[models.Vacacion], nuevo=None):
+        self.ingreso: date = principal.fecha_ingreso
+        self.fin_de_semana = _solo_fin_de_semana(principal.horario_semanal)
+        self.anios: Dict[int, dict] = {}
+        self.adelanto_total = 0.0
+        firmes = [
+            v for v in periodos
+            if v.tipo == "descuento" or (v.tipo == "vacaciones" and _estado(v) in ("autorizada", "tomada"))
+        ]
+        pendientes = [v for v in periodos if v.tipo == "vacaciones" and _estado(v) == "solicitada"]
+
+        def orden(v):
+            return (v.fecha_inicio, v.id or 0)
+
+        for v in sorted(firmes, key=orden):
+            if v.tipo == "descuento":
+                self._descuento(v)
+            else:
+                self._consumir(float(v.dias or 0), v.fecha_inicio, v.id, pendiente=False)
+        for v in sorted(pendientes, key=orden):
+            self._consumir(float(v.dias or 0), v.fecha_inicio, v.id, pendiente=True)
+        if nuevo is not None:
+            # Solicitud que se esta validando (aun sin id): (fecha_inicio, dias)
+            self._consumir(float(nuevo[1]), nuevo[0], None, pendiente=True)
+
+    def anio(self, n: int) -> dict:
+        if n not in self.anios:
+            inicio = _aniversario(self.ingreso, self.ingreso.year + n)
+            corresponden = _dias_lft(n, inicio)
+            if self.fin_de_semana:
+                corresponden = math.ceil(corresponden / 3)
+            self.anios[n] = {
+                "ciclo_inicio": inicio,
+                "ciclo_fin": _aniversario(self.ingreso, self.ingreso.year + n + 1) - timedelta(days=1),
+                "caduca": _caducidad(inicio) if n > 0 else None,
+                "dias_corresponden": corresponden,
+                "dias_tomados": 0.0,
+                "dias_descuentos": 0.0,
+                "dias_adelanto": 0.0,
+                "dias_solicitados_pendientes": 0.0,
+                "restante": float(corresponden),  # tras lo firme y lo solicitado
+                "periodos": {},  # id de vacacion -> dias que salen de este año
+            }
+        return self.anios[n]
+
+    def _descuento(self, v: models.Vacacion) -> None:
+        a = self.anio(max(1, _anios_cumplidos(self.ingreso, v.fecha_inicio)))
+        dias = float(v.dias or 0)
+        a["dias_descuentos"] += dias
+        a["restante"] -= dias
+        a["periodos"][v.id] = a["periodos"].get(v.id, 0.0) + dias
+
+    def vigentes(self, fecha: date) -> List[dict]:
+        # Años ganados y sin caducar en esa fecha, el mas viejo primero (a lo mas 2)
+        k = _anios_cumplidos(self.ingreso, fecha)
+        return [
+            self.anio(n) for n in (k - 1, k)
+            if n >= 1 and self.anio(n)["ciclo_inicio"] <= fecha <= self.anio(n)["caduca"]
+        ]
+
+    def _consumir(self, dias: float, fecha: date, vid, pendiente: bool) -> None:
+        falta = dias
+        while falta > _CERO:
+            adelanto = False
+            a = next((x for x in self.vigentes(fecha) if x["restante"] > _CERO), None)
+            if a is None:
+                # Adelanto: del siguiente año que se va a ganar y que todavia tiene dias
+                adelanto = True
+                n = _anios_cumplidos(self.ingreso, fecha) + 1
+                while self.anio(n)["restante"] <= _CERO:
+                    n += 1
+                a = self.anio(n)
+            t = min(falta, a["restante"])
+            a["restante"] -= t
+            falta -= t
+            if pendiente:
+                a["dias_solicitados_pendientes"] += t
+            else:
+                a["dias_tomados"] += t
+                if adelanto:
+                    a["dias_adelanto"] += t
+            if adelanto:
+                self.adelanto_total += t
+            if vid is not None:
+                a["periodos"][vid] = a["periodos"].get(vid, 0.0) + t
+
+    def saldo(self, n: int) -> dict:
+        a = self.anio(n)
+        usados = a["dias_tomados"] + a["dias_descuentos"]
+        return {
+            "anios": n,
+            "dias_corresponden": a["dias_corresponden"],
+            "ciclo_inicio": a["ciclo_inicio"],
+            "ciclo_fin": a["ciclo_fin"],
+            "caduca": a["caduca"],
+            "dias_tomados": a["dias_tomados"],
+            "dias_descuentos": a["dias_descuentos"],
+            "dias_adelanto": a["dias_adelanto"],
+            "dias_usados": usados,
+            "dias_solicitados_pendientes": a["dias_solicitados_pendientes"],
+            "dias_quedan": a["dias_corresponden"] - usados,
+        }
+
+    def disponibles(self, fecha: date) -> float:
+        # Lo que todavia se puede pedir para esa fecha: años vigentes, sin lo solicitado
+        return sum(max(a["restante"], 0.0) for a in self.vigentes(fecha))
+
+
+def _reparto(principal: Optional[models.Usuario], periodos: List[models.Vacacion], nuevo=None) -> Optional[_Reparto]:
+    if not principal or not principal.fecha_ingreso:
+        return None
+    return _Reparto(principal, periodos, nuevo)
+
+
 def _calcular_saldo(
-    principal: Optional[models.Usuario], periodos: List[models.Vacacion], fecha: date
+    principal: Optional[models.Usuario],
+    periodos: List[models.Vacacion],
+    fecha: date,
+    reparto: Optional[_Reparto] = None,
 ) -> Optional[dict]:
     """Saldo del año de vacaciones donde cae `fecha`. None si no hay fecha de ingreso.
 
-    usados = vacaciones autorizadas/tomadas + descuentos, con fecha_inicio dentro del año.
-    pendientes = vacaciones en 'solicitada' dentro del año (no se restan de quedan).
-    Antes de la fecha de ingreso cuenta como año 0 (le tocan 0).
+    Los numeros salen del reparto FIFO (_Reparto): usados = lo que salio de ESTE año
+    (aunque el periodo sea de otra fecha), pendientes = solicitadas que saldrian de este año.
     """
-    ingreso = principal.fecha_ingreso if principal else None
-    if not ingreso:
+    reparto = reparto or _reparto(principal, periodos)
+    if reparto is None:
         return None
-    anios = max(0, fecha.year - ingreso.year - (1 if _aniversario(ingreso, fecha.year) > fecha else 0))
-    ciclo_inicio = _aniversario(ingreso, ingreso.year + anios)
-    ciclo_fin = _aniversario(ingreso, ingreso.year + anios + 1) - timedelta(days=1)
-    corresponden = _dias_lft(anios, ciclo_inicio)
-    if _solo_fin_de_semana(principal.horario_semanal):
-        corresponden = math.ceil(corresponden / 3)
+    return reparto.saldo(_anios_cumplidos(reparto.ingreso, fecha))
 
-    tomados = descuentos = pendientes = 0.0
-    for v in periodos:
-        # Cada periodo cuenta en el año donde empieza
-        if not (ciclo_inicio <= v.fecha_inicio <= ciclo_fin):
-            continue
-        estado = (v.estado or "").strip().lower()
-        if v.tipo == "descuento":
-            descuentos += float(v.dias or 0)
-        elif v.tipo == "vacaciones" and estado in ("autorizada", "tomada"):
-            tomados += float(v.dias or 0)
-        elif v.tipo == "vacaciones" and estado == "solicitada":
-            pendientes += float(v.dias or 0)
-    usados = tomados + descuentos
-    return {
-        "anios": anios,
-        "dias_corresponden": corresponden,
-        "ciclo_inicio": ciclo_inicio,
-        "ciclo_fin": ciclo_fin,
-        "dias_tomados": tomados,
-        "dias_descuentos": descuentos,
-        "dias_usados": usados,
-        "dias_solicitados_pendientes": pendientes,
-        "dias_quedan": corresponden - usados,
-    }
+
+def anios_de_vacaciones(reparto: _Reparto, hoy: date) -> List[dict]:
+    """Del año 1 al siguiente al actual (mas los que tengan adelantos), con caducidad y
+    los dias que salen de cada periodo."""
+    actual = _anios_cumplidos(reparto.ingreso, hoy)
+    hasta = max([actual + 1] + [n for n, a in reparto.anios.items() if a["periodos"]])
+    filas = []
+    for n in range(1, hasta + 1):
+        a = reparto.anio(n)
+        filas.append(
+            {
+                **reparto.saldo(n),
+                "vigente": a["ciclo_inicio"] <= hoy <= a["caduca"],
+                "caducado": hoy > a["caduca"],
+                "periodos": [{"id": vid, "dias": d} for vid, d in a["periodos"].items()],
+            }
+        )
+    return filas
+
+
+def _datos_persona(db: Session, clave_norm: str):
+    principal = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
+    return principal, _periodos_saldo(db, [clave_norm]).get(clave_norm, [])
 
 
 def saldo_vacaciones(db: Session, clave: str, fecha: date) -> Optional[dict]:
     """Funcion unica de saldo por (clave, fecha)."""
-    clave_norm = _normalizar(clave)
-    principal = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
-    return _calcular_saldo(principal, _periodos_saldo(db, [clave_norm]).get(clave_norm, []), fecha)
+    principal, periodos = _datos_persona(db, _normalizar(clave))
+    return _calcular_saldo(principal, periodos, fecha)
 
 
 def saldo_actual_y_siguiente(db: Session, clave: str) -> dict:
     clave_norm = _normalizar(clave)
     hoy = datetime.now(ZONA_MX).date()
-    actual = saldo_vacaciones(db, clave_norm, hoy)
-    siguiente = (
-        saldo_vacaciones(db, clave_norm, actual["ciclo_fin"] + timedelta(days=1)) if actual else None
-    )
-    return {"clave": clave_norm, "actual": actual, "siguiente": siguiente}
+    principal, periodos = _datos_persona(db, clave_norm)
+    reparto = _reparto(principal, periodos)
+    if reparto is None:
+        return {"clave": clave_norm, "actual": None, "siguiente": None}
+    actual = _calcular_saldo(principal, periodos, hoy, reparto)
+    siguiente = _calcular_saldo(principal, periodos, actual["ciclo_fin"] + timedelta(days=1), reparto)
+    anios = anios_de_vacaciones(reparto, hoy)
+    vigentes = [a for a in anios if a["vigente"]]
+    return {
+        "clave": clave_norm,
+        "actual": actual,
+        "siguiente": siguiente,
+        "anios": anios,
+        # Hoy, entre los años vigentes (el atrasado y el actual)
+        "total_quedan": sum(max(a["dias_quedan"], 0.0) for a in vigentes),
+        "total_disponibles": reparto.disponibles(hoy),
+    }
 
 
 def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[int, dict]:
@@ -497,6 +678,7 @@ def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[
     claves = {_normalizar(v.clave) for v in vacaciones}
     cuentas = _cuentas_por_clave(db, claves)
     periodos = _periodos_saldo(db, claves)
+    repartos: Dict[str, Optional[_Reparto]] = {}
     resultado: Dict[int, dict] = {}
     for v in vacaciones:
         clave = _normalizar(v.clave)
@@ -512,31 +694,41 @@ def _saldos_solicitudes(db: Session, vacaciones: List[models.Vacacion]) -> Dict[
         if v.tipo == "dia_extra":
             resultado[v.id] = datos
             continue
-        saldo = _calcular_saldo(_principal(cuentas[clave]), periodos.get(clave, []), v.fecha_inicio)
+        principal = _principal(cuentas[clave])
+        if clave not in repartos:
+            repartos[clave] = _reparto(principal, periodos.get(clave, []))
+        reparto = repartos[clave]
+        saldo = _calcular_saldo(principal, periodos.get(clave, []), v.fecha_inicio, reparto)
         if saldo:
             datos.update({k: saldo[k] for k in _SALDO_VACIO if k in saldo})
+            # "Le quedan" = lo de los años vigentes en esa fecha (atrasado + actual)
+            vig = reparto.vigentes(v.fecha_inicio)
+            datos["dias_quedan"] = sum(
+                a["dias_corresponden"] - a["dias_tomados"] - a["dias_descuentos"] for a in vig
+            )
+            datos["dias_solicitados_pendientes"] = sum(a["dias_solicitados_pendientes"] for a in vig)
         resultado[v.id] = datos
     return resultado
 
 
-def _ciclos_persona(principal: models.Usuario, periodos: List[models.Vacacion], actual: dict) -> List[dict]:
+def _ciclos_persona(reparto: _Reparto, actual: dict, hoy: date) -> List[dict]:
     # Del primer aniversario al ciclo actual, mas el siguiente (con 0 años, el actual y el siguiente)
-    ingreso = principal.fecha_ingreso
     ciclos: List[dict] = []
     for anios in range(min(1, actual["anios"]), actual["anios"] + 2):
-        saldo = _calcular_saldo(principal, periodos, _aniversario(ingreso, ingreso.year + anios))
+        saldo = reparto.saldo(anios)
         if anios < actual["anios"]:
             estado = "Cerrado"
         elif anios == actual["anios"]:
             estado = "Actual"
         else:
             estado = "Siguiente"
+        caducado = saldo["caduca"] is not None and hoy > saldo["caduca"]
         ciclos.append(
             {
                 **saldo,
                 "estado": estado,
-                # Los dias no se acumulan: lo que sobro de un ciclo cerrado se pierde
-                "dias_perdidos": max(saldo["dias_quedan"], 0.0) if estado == "Cerrado" else None,
+                # Lo que sobro se pierde solo cuando el año ya caduco (18 meses)
+                "dias_perdidos": max(saldo["dias_quedan"], 0.0) if estado == "Cerrado" and caducado else None,
             }
         )
     return ciclos
@@ -581,7 +773,8 @@ def panel_vacaciones(
             "fecha_ingreso": principal.fecha_ingreso,
             "ciclos": [],
         }
-        actual = _calcular_saldo(principal, periodos.get(clave, []), hoy)
+        reparto = _reparto(principal, periodos.get(clave, []))
+        actual = _calcular_saldo(principal, periodos.get(clave, []), hoy, reparto)
         if actual:
             fila.update(
                 {k: actual[k] for k in (
@@ -589,7 +782,7 @@ def panel_vacaciones(
                     "dias_solicitados_pendientes", "dias_quedan", "ciclo_inicio", "ciclo_fin",
                 )},
                 dias_para_aniversario=(actual["ciclo_fin"] + timedelta(days=1) - hoy).days,
-                ciclos=_ciclos_persona(principal, periodos.get(clave, []), actual),
+                ciclos=_ciclos_persona(reparto, actual, hoy),
             )
         filas.append(fila)
     return sorted(filas, key=lambda f: f["clave"])
@@ -634,7 +827,7 @@ def _meses(inicio: date, fin: date) -> set:
 def validar_fechas_vacaciones(inicio: date, fin: date, tu: bool) -> None:
     """Maximo de dias seguidos y dias bloqueados. `tu`: mensajes para la propia persona."""
     if (fin - inicio).days + 1 > MAX_DIAS_SEGUIDOS:
-        raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días seguidos por periodo")
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días por solicitud. Si necesitas más días, habla con Gerencia.")
     for n in range((fin - inicio).days + 1):
         d = inicio + timedelta(days=n)
         if _dia_bloqueado(d):
@@ -679,29 +872,32 @@ def validar_contra_periodos(existentes: List[models.Vacacion], inicio: date, fin
 
 
 def validar_saldo(db: Session, clave: str, inicio: date, dias: float, tu: bool) -> None:
-    """Sin adelantos: se valida contra el año de vacaciones donde cae fecha_inicio.
+    """Sin adelantos al pedir: los dias deben salir de años ganados y sin caducar en
+    fecha_inicio (el atrasado primero), sin dejar en adelanto nada de lo ya pedido.
     Llamar despues del candado de la persona (cuenta las solicitudes pendientes)."""
-    saldo = saldo_vacaciones(db, clave, inicio)
-    if saldo is None:
+    principal, periodos = _datos_persona(db, _normalizar(clave))
+    base = _reparto(principal, periodos)
+    if base is None:
         raise HTTPException(
             status_code=400,
             detail=f"No {'tienes' if tu else 'tiene'} fecha de ingreso; pide a RH que la registre",
         )
-    if saldo["anios"] == 0:
+    if _anios_cumplidos(base.ingreso, inicio) == 0:
         raise HTTPException(
             status_code=400,
             detail="Aún no cumples tu primer año" if tu else "Aún no cumple su primer año",
         )
-    disponibles = saldo["dias_quedan"] - saldo["dias_solicitados_pendientes"]
-    if dias > disponibles:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Solo {'te' if tu else 'le'} quedan {_numero(max(disponibles, 0))} días "
-                f"en el año de vacaciones del {_texto_fecha(saldo['ciclo_inicio'])} "
-                f"al {_texto_fecha(saldo['ciclo_fin'])}"
-            ),
-        )
+    con_nuevo = _Reparto(principal, periodos, nuevo=(inicio, dias))
+    if con_nuevo.adelanto_total <= base.adelanto_total + _CERO:
+        return
+    disponibles = base.disponibles(inicio)
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Solo {'te' if tu else 'le'} quedan {_numero(max(disponibles, 0))} días "
+            f"para tomar a partir del {_texto_fecha(inicio)}"
+        ),
+    )
 
 
 def candado_persona(db: Session, clave_norm: str) -> None:
