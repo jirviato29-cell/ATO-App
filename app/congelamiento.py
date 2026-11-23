@@ -134,6 +134,8 @@ def _marcas_asistencia(
         .filter(
             models.Asistencia.usuario_id.in_(usuario_ids),
             models.Asistencia.fecha.between(inicio, fin),
+            # Las marcas de comida no cuentan como entrada ni salida.
+            models.Asistencia.tipo.in_(("entrada", "salida")),
         )
         .all()
     )

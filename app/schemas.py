@@ -27,7 +27,7 @@ class AsistenciaLegacyResponse(AsistenciaLegacyBase):
 # ── Schemas de Asistencia geolocalizada ──────────────────────────────────────
 
 class AsistenciaCreate(BaseModel):
-    tipo: Literal["entrada", "salida"]
+    tipo: Literal["entrada", "salida", "salida_comida", "regreso_comida"]
     latitud: float
     longitud: float
     foto_base64: str
@@ -69,6 +69,11 @@ class AsistenciaResumenDia(BaseModel):
     modulo_id: Optional[int] = None
     modulo_nombre: Optional[str] = None
     lugar_trabajo: Optional[str] = None
+    # Comida (solo encargados registran estas marcas)
+    salida_comida: Optional[datetime] = None
+    regreso_comida: Optional[datetime] = None
+    minutos_comida: int = 0
+    puede_registrar_comida: bool = False
 
 
 class JustificacionCreate(BaseModel):
@@ -1223,6 +1228,7 @@ class DiaResumen(BaseModel):
     entrada: Optional[datetime] = None
     salida: Optional[datetime] = None
     horas: float = 0.0
+    minutos_comida: int = 0
 
 
 class EmpleadoAcumuladoSemanal(BaseModel):

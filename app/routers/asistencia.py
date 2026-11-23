@@ -1,7 +1,7 @@
 import base64
 import os
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -44,12 +44,46 @@ def _supabase_admin():
 
 # ── Helper: agrupar registros por (usuario, fecha) ───────────────────────────
 
-def _agrupar(registros: list, include_user: bool = False) -> List[schemas.AsistenciaResumenDia]:
+TIPOS_JORNADA = ("entrada", "salida")
+TIPOS_COMIDA = ("salida_comida", "regreso_comida")
+ROLES_COMIDA = ("encargado",)
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Naive se asume UTC (así lo guarda/lee la BD); aware se convierte a UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _minutos_comida(sal_com, reg_com) -> int:
+    """Minutos de comida solo si existen AMBAS marcas y el regreso es posterior."""
+    if not (sal_com and reg_com and sal_com.hora and reg_com.hora):
+        return 0
+    seg = (_to_utc(reg_com.hora) - _to_utc(sal_com.hora)).total_seconds()
+    return max(0, int(round(seg / 60)))
+
+
+def _horas_netas(ent, sal, minutos_comida: int) -> float:
+    """(salida - entrada) - comida. Nunca negativo. 0 si falta entrada o salida."""
+    if not (ent and sal and ent.hora and sal.hora):
+        return 0.0
+    seg = (_to_utc(sal.hora) - _to_utc(ent.hora)).total_seconds() - minutos_comida * 60
+    return max(0.0, seg / 3600)
+
+
+def _agrupar(
+    registros: list,
+    include_user: bool = False,
+    puede_registrar_comida: bool = False,
+) -> List[schemas.AsistenciaResumenDia]:
     dias: dict = {}
     for r in registros:
+        if r.tipo not in TIPOS_JORNADA and r.tipo not in TIPOS_COMIDA:
+            continue
         key = (r.usuario_id, r.fecha) if include_user else (0, r.fecha)
         if key not in dias:
-            dias[key] = {"entrada": None, "salida": None}
+            dias[key] = {}
         dias[key][r.tipo] = r
 
     resultado = []
@@ -57,16 +91,16 @@ def _agrupar(registros: list, include_user: bool = False) -> List[schemas.Asiste
         data = dias[key]
         ent = data.get("entrada")
         sal = data.get("salida")
+        sal_com = data.get("salida_comida")
+        reg_com = data.get("regreso_comida")
 
-        horas = 0.0
-        if ent and sal and ent.hora and sal.hora:
-            from datetime import timezone as _utc
-            def _to_utc(dt):
-                if dt.tzinfo is None:
-                    return dt.replace(tzinfo=_utc.utc)
-                return dt.astimezone(_utc.utc)
-            delta = _to_utc(sal.hora) - _to_utc(ent.hora)
-            horas = max(0.0, delta.total_seconds() / 3600)
+        # Día con solo marcas de comida (p. ej. entrada borrada por corrección):
+        # no hay jornada que reportar.
+        if not ent and not sal:
+            continue
+
+        minutos_comida = _minutos_comida(sal_com, reg_com)
+        horas = _horas_netas(ent, sal, minutos_comida)
 
         ref = ent or sal
         modulo_nombre = None
@@ -94,6 +128,10 @@ def _agrupar(registros: list, include_user: bool = False) -> List[schemas.Asiste
             modulo_id=ent.modulo_id if ent else (sal.modulo_id if sal else None),
             modulo_nombre=modulo_nombre,
             lugar_trabajo=lugar_trabajo,
+            salida_comida=sal_com.hora if sal_com else None,
+            regreso_comida=reg_com.hora if reg_com else None,
+            minutos_comida=minutos_comida,
+            puede_registrar_comida=puede_registrar_comida,
         ))
     return resultado
 
@@ -109,13 +147,60 @@ def check_asistencia(
     if current_user.rol not in ("asesor", "encargado"):
         raise HTTPException(403, "Solo asesores y encargados pueden registrar asistencia")
 
+    if body.tipo in TIPOS_COMIDA and current_user.rol not in ROLES_COMIDA:
+        raise HTTPException(403, detail={
+            "codigo": "COMIDA_SOLO_ENCARGADO",
+            "mensaje": "Solo los encargados pueden registrar salida y regreso de comer.",
+        })
+
     modulo = db.query(models.Modulo).filter(models.Modulo.id == current_user.modulo_id).first()
     if not modulo:
         raise HTTPException(404, "El usuario no tiene módulo asignado")
 
     fecha_actual = datetime.now(ZONA).date()
 
-    if body.tipo == "entrada":
+    # Marcas de hoy del usuario, por tipo.
+    marcas_hoy = {
+        r.tipo: r
+        for r in db.query(models.Asistencia).filter(
+            models.Asistencia.usuario_id == current_user.id,
+            models.Asistencia.fecha == fecha_actual,
+        ).all()
+    }
+
+    if body.tipo == "salida_comida":
+        if "entrada" not in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "COMIDA_SIN_CHECKIN",
+                "mensaje": "Primero registra tu CHECK-IN de hoy antes de salir a comer.",
+            })
+        if "salida" in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "COMIDA_DESPUES_DE_SALIDA",
+                "mensaje": "Ya registraste tu CHECK-OUT de hoy; no puedes salir a comer.",
+            })
+        if "salida_comida" in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "SALIDA_COMIDA_DUPLICADA",
+                "mensaje": f"Ya registraste tu salida a comer de hoy a las {_hora_mx_str(marcas_hoy['salida_comida'].hora)}",
+            })
+    elif body.tipo == "regreso_comida":
+        if "salida_comida" not in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "REGRESO_SIN_SALIDA_COMIDA",
+                "mensaje": "Primero registra tu salida a comer.",
+            })
+        if "regreso_comida" in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "REGRESO_COMIDA_DUPLICADO",
+                "mensaje": f"Ya registraste tu regreso de comer de hoy a las {_hora_mx_str(marcas_hoy['regreso_comida'].hora)}",
+            })
+        if "salida" in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "COMIDA_DESPUES_DE_SALIDA",
+                "mensaje": "Ya registraste tu CHECK-OUT de hoy.",
+            })
+    elif body.tipo == "entrada":
         existente = db.query(models.Asistencia).filter(
             models.Asistencia.usuario_id == current_user.id,
             models.Asistencia.fecha == fecha_actual,
@@ -126,7 +211,7 @@ def check_asistencia(
                 "codigo": "ENTRADA_DUPLICADA",
                 "mensaje": f"Ya tienes registrado tu CHECK-IN de hoy a las {_hora_mx_str(existente.hora)}. Si crees que es un error, reporta a administración.",
             })
-    else:
+    elif body.tipo == "salida":
         entrada_hoy = db.query(models.Asistencia).filter(
             models.Asistencia.usuario_id == current_user.id,
             models.Asistencia.fecha == fecha_actual,
@@ -159,6 +244,13 @@ def check_asistencia(
                 "codigo": "SALIDA_DUPLICADA",
                 "mensaje": f"Ya tienes registrado tu CHECK-OUT de hoy a las {_hora_mx_str(salida_existente.hora)}. Si crees que es un error, reporta a administración.",
             })
+        if "salida_comida" in marcas_hoy and "regreso_comida" not in marcas_hoy:
+            raise HTTPException(400, detail={
+                "codigo": "COMIDA_ABIERTA",
+                "mensaje": "Primero registra tu regreso de comer",
+            })
+    else:
+        raise HTTPException(400, "Tipo de asistencia no válido")
 
     # Determinar si es promotor de Cadenas (módulo contiene "Cadenas" y username empieza con "C")
     is_cadenas_promotor = (
@@ -281,7 +373,8 @@ def check_asistencia(
             username=current_user.username,
             modulo_id=current_user.modulo_id,
             mensaje=(
-                f"{current_user.username} hizo {body.tipo} fuera de zona "
+                f"{current_user.username} hizo "
+                f"{ {'salida_comida': 'salida a comer', 'regreso_comida': 'regreso de comer'}.get(body.tipo, body.tipo)} fuera de zona "
                 f"— a {int(distancia)} metros del punto de referencia"
             ),
             distancia_metros=distancia,
@@ -312,7 +405,10 @@ def mi_historial(
         )
         .all()
     )
-    return _agrupar(registros)
+    return _agrupar(
+        registros,
+        puede_registrar_comida=current_user.rol in ROLES_COMIDA,
+    )
 
 
 @router.get("/admin", response_model=List[schemas.AsistenciaResumenDia])
@@ -457,6 +553,7 @@ def acumulado_semanal(
                         entrada=r.entrada,
                         salida=r.salida,
                         horas=r.horas_trabajadas,
+                        minutos_comida=r.minutos_comida,
                     )
                     total_horas += r.horas_trabajadas
                 else:
@@ -811,23 +908,11 @@ def asistencia_anomalias(
     # Agrupar registros por usuario_id (mismo criterio que _agrupar, indexado por usuario)
     por_usuario: Dict[int, dict] = {}
     for r in registros:
+        if r.tipo not in TIPOS_JORNADA and r.tipo not in TIPOS_COMIDA:
+            continue
         if r.usuario_id not in por_usuario:
-            por_usuario[r.usuario_id] = {"entrada": None, "salida": None}
+            por_usuario[r.usuario_id] = {}
         por_usuario[r.usuario_id][r.tipo] = r
-
-    # Horas con la MISMA lógica de _agrupar
-    from datetime import timezone as _utc
-
-    def _to_utc(dt):
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=_utc.utc)
-        return dt.astimezone(_utc.utc)
-
-    def _horas(ent, sal):
-        if ent and sal and ent.hora and sal.hora:
-            delta = _to_utc(sal.hora) - _to_utc(ent.hora)
-            return max(0.0, delta.total_seconds() / 3600)
-        return 0.0
 
     # Agrupar el universo por PERSONA (nombre_englobado, o id:<id> si no englobada).
     personas: Dict[str, List[models.Usuario]] = {}
@@ -874,6 +959,7 @@ def asistencia_anomalias(
         # Consolidar asistencia: juntar entradas/salidas de TODAS las cuentas.
         entradas = []
         salidas = []
+        minutos_comida = 0
         for c in cuentas:
             data = por_usuario.get(c.id)
             if not data:
@@ -884,19 +970,24 @@ def asistencia_anomalias(
                 entradas.append(ent)
             if sal and sal.hora:
                 salidas.append(sal)
+            # Comida solo cuenta si la cuenta tiene AMBAS marcas.
+            minutos_comida += _minutos_comida(
+                data.get("salida_comida"), data.get("regreso_comida")
+            )
 
         mejor_entrada = min(entradas, key=lambda r: _to_utc(r.hora)) if entradas else None
         mejor_salida = max(salidas, key=lambda r: _to_utc(r.hora)) if salidas else None
 
         # Clasificación única por persona.
         if mejor_entrada and mejor_salida:
-            horas = _horas(mejor_entrada, mejor_salida)
+            horas = _horas_netas(mejor_entrada, mejor_salida, minutos_comida)
             if horas < 1:
                 menos_de_una_hora.append({
                     **base,
                     "entrada": mejor_entrada.hora,
                     "salida": mejor_salida.hora,
                     "horas_trabajadas": round(horas, 2),
+                    "minutos_comida": minutos_comida,
                 })
             # entrada + salida con horas >= 1 NO es anomalía: se omite
         elif mejor_entrada and not mejor_salida:
