@@ -1231,6 +1231,8 @@ class DiaResumen(BaseModel):
     salida: Optional[datetime] = None
     horas: float = 0.0
     minutos_comida: int = 0
+    salida_comida: Optional[datetime] = None
+    regreso_comida: Optional[datetime] = None
 
 
 class EmpleadoAcumuladoSemanal(BaseModel):

@@ -556,6 +556,8 @@ def acumulado_semanal(
                         salida=r.salida,
                         horas=r.horas_trabajadas,
                         minutos_comida=r.minutos_comida,
+                        salida_comida=r.salida_comida,
+                        regreso_comida=r.regreso_comida,
                     )
                     total_horas += r.horas_trabajadas
                 else:
