@@ -74,6 +74,8 @@ class AsistenciaResumenDia(BaseModel):
     regreso_comida: Optional[datetime] = None
     minutos_comida: int = 0
     puede_registrar_comida: bool = False
+    foto_salida_comida_url: Optional[str] = None
+    foto_regreso_comida_url: Optional[str] = None
 
 
 class JustificacionCreate(BaseModel):

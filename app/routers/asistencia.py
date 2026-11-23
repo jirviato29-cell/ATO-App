@@ -132,6 +132,8 @@ def _agrupar(
             regreso_comida=reg_com.hora if reg_com else None,
             minutos_comida=minutos_comida,
             puede_registrar_comida=puede_registrar_comida,
+            foto_salida_comida_url=sal_com.foto_url if sal_com else None,
+            foto_regreso_comida_url=reg_com.foto_url if reg_com else None,
         ))
     return resultado
 
