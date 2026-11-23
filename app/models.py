@@ -161,6 +161,22 @@ class DiaDescanso(Base):
     cancelador = relationship("Usuario", foreign_keys=[cancelado_por])
 
 
+class AvisoComida(Base):
+    """Avisos de WhatsApp de la comida de encargados. Tabla creada a mano en Supabase
+    (solo mapeo, sin migraciones). UNIQUE(asistencia_id, tipo_aviso) evita duplicados."""
+    __tablename__ = "avisos_comida"
+    __table_args__ = (UniqueConstraint("asistencia_id", "tipo_aviso", name="avisos_comida_unico"),)
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    asistencia_id = Column(BigInteger, ForeignKey("asistencia.id"), nullable=False)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=False)
+    tipo_aviso = Column(Text, nullable=False)
+    telefono = Column(Text, nullable=True)
+    estado = Column(Text, nullable=False, server_default="enviado")
+    error = Column(Text, nullable=True)
+    enviado_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class NotificacionAsistencia(Base):
     __tablename__ = "notificaciones_asistencia"
 

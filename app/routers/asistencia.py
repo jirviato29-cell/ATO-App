@@ -1347,3 +1347,148 @@ def cancelar_dia_descanso(
     db.commit()
 
     return _estado_dia(db, current_user, hoy)
+
+
+# ── Avisos de comida por WhatsApp (Twilio, número de reportes) ───────────────
+# POST /asistencia/avisos-comida  (sin JWT, protegido con REPORTE_PDF_KEY igual que el reporte diario)
+# Lo llama un cron externo. Apagado salvo AVISOS_COMIDA_ACTIVO == "true".
+
+AVISO_RECORDATORIO_5MIN = "recordatorio_5min"
+MIN_COMIDA_AVISO = 120          # la comida dura 2 h
+MIN_ANTES_AVISO = 5             # aviso entre +115 y +120 min
+
+
+def _primer_nombre(u) -> str:
+    nombre = (u.nombre_completo or "").strip()
+    if not nombre and u.nombre_englobado and "-" in u.nombre_englobado:
+        nombre = u.nombre_englobado.split("-", 1)[1].strip()
+    if not nombre:
+        nombre = (u.username or "").strip()
+    return nombre.split()[0].capitalize() if nombre else ""
+
+
+def _telefono_10(u) -> str:
+    return "".join(ch for ch in (u.whatsapp or "") if ch.isdigit())
+
+
+def _procesar_avisos_comida(db: Session, ahora: datetime, prueba: bool, enviar=None) -> dict:
+    """Selecciona a quién toca el aviso de 5 min y (si no es prueba) lo manda.
+    `ahora` debe venir con zona (México)."""
+    if enviar is None:
+        from app.whatsapp_twilio import enviar_whatsapp_plantilla as enviar
+
+    hoy = ahora.astimezone(ZONA).date()
+    content_sid = os.environ.get("TWILIO_TEMPLATE_COMIDA_SID", "")
+
+    # a) salidas a comer de hoy de encargados
+    salidas = (
+        db.query(models.Asistencia, models.Usuario)
+        .join(models.Usuario, models.Usuario.id == models.Asistencia.usuario_id)
+        .filter(
+            models.Asistencia.fecha == hoy,
+            models.Asistencia.tipo == "salida_comida",
+            models.Usuario.rol == models.RolEnum.encargado,
+        )
+        .all()
+    )
+
+    enviados, omitidos, errores = [], [], []
+    if not salidas:
+        return {"activo": True, "prueba": prueba, "ahora": ahora.isoformat(),
+                "enviados": enviados, "omitidos": omitidos, "errores": errores}
+
+    usuario_ids = list({a.usuario_id for a, _ in salidas})
+    # b) marcas de regreso_comida / salida de hoy
+    cierres = {
+        (uid, tipo)
+        for uid, tipo in db.query(models.Asistencia.usuario_id, models.Asistencia.tipo).filter(
+            models.Asistencia.fecha == hoy,
+            models.Asistencia.usuario_id.in_(usuario_ids),
+            models.Asistencia.tipo.in_(("regreso_comida", "salida")),
+        )
+    }
+    # d) avisos ya registrados
+    ya_avisados = {
+        aid
+        for (aid,) in db.query(models.AvisoComida.asistencia_id).filter(
+            models.AvisoComida.asistencia_id.in_([a.id for a, _ in salidas]),
+            models.AvisoComida.tipo_aviso == AVISO_RECORDATORIO_5MIN,
+        )
+    }
+
+    for a, u in salidas:
+        base = {"asistencia_id": a.id, "usuario_id": u.id, "username": u.username}
+        if a.hora is None:
+            omitidos.append({**base, "motivo": "sin_hora"})
+            continue
+        salida_mx = _to_utc(a.hora).astimezone(ZONA)
+        regreso_mx = salida_mx + timedelta(minutes=MIN_COMIDA_AVISO)
+        desde = regreso_mx - timedelta(minutes=MIN_ANTES_AVISO)
+        base["salida_comida"] = _hora_mx_str(salida_mx)
+        base["hora_regreso"] = _hora_mx_str(regreso_mx)
+
+        if (u.id, "regreso_comida") in cierres:
+            omitidos.append({**base, "motivo": "ya_regreso"}); continue
+        if (u.id, "salida") in cierres:
+            omitidos.append({**base, "motivo": "ya_hizo_checkout"}); continue
+        if not (desde <= ahora <= regreso_mx):          # c) ventana +115..+120 min
+            omitidos.append({**base, "motivo": "fuera_de_ventana"}); continue
+        if a.id in ya_avisados:
+            omitidos.append({**base, "motivo": "ya_avisado"}); continue
+
+        telefono = _telefono_10(u)
+        nombre = _primer_nombre(u)
+        variables = {"1": nombre, "2": base["hora_regreso"]}
+        item = {**base, "telefono": telefono or None, "variables": variables}
+
+        if prueba:
+            (enviados if telefono else omitidos).append(
+                item if telefono else {**item, "motivo": "sin_telefono"})
+            continue
+
+        # Insert primero (UNIQUE asistencia_id+tipo_aviso): si no se insertó, ya lo mandó otra llamada.
+        estado = "enviado" if telefono else "sin_telefono"
+        fila = db.execute(
+            text(
+                "INSERT INTO avisos_comida (asistencia_id, usuario_id, tipo_aviso, telefono, estado) "
+                "VALUES (:aid, :uid, :tipo, :tel, :estado) "
+                "ON CONFLICT (asistencia_id, tipo_aviso) DO NOTHING RETURNING id"
+            ),
+            {"aid": a.id, "uid": u.id, "tipo": AVISO_RECORDATORIO_5MIN,
+             "tel": telefono or None, "estado": estado},
+        ).first()
+        db.commit()
+        if fila is None:
+            omitidos.append({**base, "motivo": "ya_avisado"}); continue
+        if not telefono:
+            omitidos.append({**item, "motivo": "sin_telefono"}); continue
+
+        try:
+            sid = enviar(telefono, content_sid, variables)
+            enviados.append({**item, "sid": sid})
+        except Exception as e:
+            db.execute(
+                text("UPDATE avisos_comida SET estado = 'error', error = :err WHERE id = :id"),
+                {"err": str(e)[:1000], "id": fila[0]},
+            )
+            db.commit()
+            errores.append({**item, "error": str(e)})
+
+    return {"activo": True, "prueba": prueba, "ahora": ahora.isoformat(),
+            "enviados": enviados, "omitidos": omitidos, "errores": errores}
+
+
+@router.post("/avisos-comida")
+def avisos_comida(
+    key: str = Query(...),
+    prueba: int = Query(0),
+    db: Session = Depends(get_db),
+):
+    expected = os.environ.get("REPORTE_PDF_KEY", "")
+    if not expected or key != expected:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    if os.environ.get("AVISOS_COMIDA_ACTIVO", "") != "true":
+        return {"activo": False}
+
+    return _procesar_avisos_comida(db, datetime.now(ZONA), prueba == 1)
