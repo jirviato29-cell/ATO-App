@@ -1,12 +1,12 @@
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app import avisos, models
+from app import avisos, cubre_por_dia, models
 from app.config import get_current_user
 from app.database import get_db
 from app.permisos_vacaciones import mapa_encargados
@@ -23,6 +23,7 @@ from app.routers.vacaciones import (
     _principal,
     _serializar,
     _texto_fecha,
+    serializar_con_dias,
     _usuario_activo,
     candado_persona,
     dias_extra_de,
@@ -127,8 +128,7 @@ def mis_vacaciones(
         .order_by(models.Vacacion.fecha_inicio, models.Vacacion.id)
         .all()
     )
-    nombres = _nombres_aprobadores(db, vacaciones)
-    return [_serializar(v, nombres) for v in vacaciones]
+    return serializar_con_dias(db, vacaciones)
 
 
 @router.get("/vacaciones/saldo", response_model=SaldoResponse)
@@ -162,6 +162,14 @@ DIAS_ANTICIPACION = 31
 DIAS_PARA_CANCELAR = 7
 
 
+class CubreDia(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fecha: date
+    # null = "No tengo quién me cubra" ese día
+    cubre_clave: Optional[str] = Field(None, max_length=50)
+
+
 class SolicitudVacacion(BaseModel):
     # extra="forbid": si mandan clave, id o cualquier otro campo, se rechaza (422)
     model_config = ConfigDict(extra="forbid")
@@ -174,6 +182,9 @@ class SolicitudVacacion(BaseModel):
     cubre_clave: Optional[str] = Field(None, max_length=50)
     # La persona eligió "No tengo quién me cubra". El día extra exige cubre_clave o esto.
     sin_cubre: bool = False
+    # "Cubrir por día": una fila por CADA fecha del periodo. Si todas quedan con la misma
+    # persona se guarda como siempre (cubre_clave), sin filas por día.
+    cubre_por_dia: Optional[List[CubreDia]] = Field(None, max_length=62)
     nota: Optional[str] = Field(None, max_length=500)
     # "dia_extra": día de descanso extra (no sale del saldo de vacaciones)
     tipo: Literal["vacaciones", "dia_extra"] = "vacaciones"
@@ -243,14 +254,15 @@ def _modulos_para_cubrir(db: Session, modulo: Optional[int]) -> set:
     return modulos or {modulo}
 
 
-def opciones_cubre(db: Session, clave_norm: str, inicio: date, fin: date) -> List[dict]:
+def _candidatas_cubre(db: Session, clave_norm: str):
+    """(claves candidatas, módulos) de quien puede cubrir a clave_norm, sin revisar fechas."""
     clave_norm = _normalizar(clave_norm)
     if not clave_norm:
-        return []
+        return set(), set()
     mia = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
     modulos = _modulos_para_cubrir(db, mia.modulo_id if mia is not None else None)
     if not modulos:
-        return []
+        return set(), set()
 
     # Candidatas: alguna cuenta activa de empleado en esos módulos; luego se revisa su principal
     claves = {
@@ -265,11 +277,13 @@ def opciones_cubre(db: Session, clave_norm: str, inicio: date, fin: date) -> Lis
     }
     claves.discard("")
     claves.discard(clave_norm)
-    if not claves:
-        return []
+    return claves, modulos
 
-    ocupadas = {
-        _normalizar(v.clave)
+
+def _ocupaciones(db: Session, claves: set, inicio: date, fin: date) -> List[tuple]:
+    """(clave, inicio, fin) de vacaciones o día extra vigentes de esas claves que tocan el rango."""
+    return [
+        (_normalizar(v.clave), v.fecha_inicio, v.fecha_fin)
         for v in db.query(models.Vacacion)
         .filter(
             _clave_columna(models.Vacacion.clave).in_(claves),
@@ -279,16 +293,41 @@ def opciones_cubre(db: Session, clave_norm: str, inicio: date, fin: date) -> Lis
         )
         .all()
         if (v.estado or "").strip().lower() in ESTADOS_VIGENTES
-    }
+    ]
 
+
+def _armar_opciones(db: Session, claves: set, modulos: set) -> List[dict]:
     opciones = []
-    for clave, cuentas in _cuentas_por_clave(db, claves - ocupadas).items():
+    for clave, cuentas in _cuentas_por_clave(db, claves).items():
         principal = _principal(cuentas)
         if principal is None or principal.rol not in ROLES_EMPLEADO or principal.modulo_id not in modulos:
             continue
         nombre = next((c.nombre_completo.strip() for c in cuentas if (c.nombre_completo or "").strip()), None)
         opciones.append({"clave": (principal.nombre_englobado or "").strip() or clave, "nombre": nombre})
     return sorted(opciones, key=lambda o: _normalizar(o["clave"]))
+
+
+def opciones_cubre(db: Session, clave_norm: str, inicio: date, fin: date) -> List[dict]:
+    claves, modulos = _candidatas_cubre(db, clave_norm)
+    if not claves:
+        return []
+    ocupadas = {c for c, _, _ in _ocupaciones(db, claves, inicio, fin)}
+    return _armar_opciones(db, claves - ocupadas, modulos)
+
+
+def opciones_cubre_por_dia(db: Session, clave_norm: str, inicio: date, fin: date) -> Dict[date, List[dict]]:
+    """Misma regla que opciones_cubre, revisada día por día (quien está libre ESA fecha)."""
+    dias = [inicio + timedelta(days=i) for i in range((fin - inicio).days + 1)]
+    claves, modulos = _candidatas_cubre(db, clave_norm)
+    if not claves:
+        return {d: [] for d in dias}
+    ocupaciones = _ocupaciones(db, claves, inicio, fin)
+    todas = _armar_opciones(db, claves, modulos)
+    salida = {}
+    for d in dias:
+        ocupadas = {c for c, i, f in ocupaciones if i <= d <= f}
+        salida[d] = [o for o in todas if _normalizar(o["clave"]) not in ocupadas]
+    return salida
 
 
 @router.get("/cubre-opciones", response_model=List[CubreOpcion])
@@ -302,6 +341,31 @@ def cubre_opciones(
     if fin < inicio:
         raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
     return opciones_cubre(db, _normalizar(usuario.nombre_englobado), inicio, fin)
+
+
+MAX_DIAS_CUBRE_POR_DIA = 62
+
+
+class CubreOpcionesDia(BaseModel):
+    fecha: date
+    opciones: List[CubreOpcion]
+
+
+@router.get("/cubre-opciones-por-dia", response_model=List[CubreOpcionesDia])
+def cubre_opciones_por_dia(
+    inicio: date,
+    fin: date,
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(get_current_user),
+):
+    # Para "Cubrir por día": la lista de cada fecha (misma regla que /cubre-opciones)
+    _exigir_piloto(usuario)
+    if fin < inicio:
+        raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
+    if (fin - inicio).days + 1 > MAX_DIAS_CUBRE_POR_DIA:
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_CUBRE_POR_DIA} días")
+    por_dia = opciones_cubre_por_dia(db, _normalizar(usuario.nombre_englobado), inicio, fin)
+    return [{"fecha": d, "opciones": por_dia[d]} for d in sorted(por_dia)]
 
 
 @router.post("/vacaciones", response_model=VacacionResponse, status_code=201)
@@ -333,7 +397,7 @@ def pedir_vacaciones(
     if es_extra:
         # 5 días de anticipación, cualquier día de la semana, sin 15 dic - 6 ene
         validar_fechas_dia_extra_empleado(inicio, fin, hoy)
-        if not (body.cubre_clave or "").strip() and not body.sin_cubre:
+        if not (body.cubre_clave or "").strip() and not body.sin_cubre and body.cubre_por_dia is None:
             raise HTTPException(
                 status_code=400,
                 detail="Elige quién te cubre (o \"No tengo quién me cubra\")",
@@ -352,7 +416,43 @@ def pedir_vacaciones(
         validar_fechas_vacaciones(inicio, fin, tu=True)
 
     cubre = None
-    if (body.cubre_clave or "").strip():
+    # Solo si quedan personas distintas por día: [(fecha, clave o None)]
+    asignaciones = None
+    if body.cubre_por_dia is not None:
+        if (body.cubre_clave or "").strip() or body.sin_cubre:
+            raise HTTPException(
+                status_code=400,
+                detail="Elige quién te cubre para todo el periodo o por día, no las dos",
+            )
+        esperadas = [inicio + timedelta(days=i) for i in range(dias)]
+        if sorted(d.fecha for d in body.cubre_por_dia) != esperadas:
+            raise HTTPException(status_code=400, detail="Indica quién te cubre cada día del periodo, sin repetir fechas")
+        # Solo alguien de la lista de GET /mi-perfil/cubre-opciones-por-dia para ESA fecha
+        por_dia = opciones_cubre_por_dia(db, clave_norm, inicio, fin)
+        elegidos = {}
+        for d in body.cubre_por_dia:
+            if not _normalizar(d.cubre_clave):
+                elegidos[d.fecha] = None
+                continue
+            permitidas = {_normalizar(o["clave"]) for o in por_dia.get(d.fecha, [])}
+            persona = _usuario_activo(db, d.cubre_clave) if _normalizar(d.cubre_clave) in permitidas else None
+            if persona is None:
+                raise HTTPException(status_code=400, detail=f"Esa persona no puede cubrirte el {_texto_fecha(d.fecha)}")
+            elegidos[d.fecha] = persona
+        distintas = {_normalizar(p.nombre_englobado) if p else "" for p in elegidos.values()}
+        if len(distintas) == 1:
+            # Todos los días con la misma persona (o todos sin nadie): se guarda como siempre
+            cubre = next(iter(elegidos.values()))
+        else:
+            if not cubre_por_dia.tabla_existe(db):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Por ahora no se puede elegir quién cubre por día: elige una sola persona para todo el periodo",
+                )
+            asignaciones = [
+                (fecha, p.nombre_englobado.strip() if p else None) for fecha, p in sorted(elegidos.items())
+            ]
+    elif (body.cubre_clave or "").strip():
         # Solo alguien de la lista de GET /mi-perfil/cubre-opciones para estas mismas fechas
         permitidas = {_normalizar(o["clave"]) for o in opciones_cubre(db, clave_norm, inicio, fin)}
         cubre = _usuario_activo(db, body.cubre_clave) if _normalizar(body.cubre_clave) in permitidas else None
@@ -399,6 +499,9 @@ def pedir_vacaciones(
         cubre_clave=cubre.nombre_englobado.strip() if cubre else None,
     )
     db.add(vacacion)
+    if asignaciones:
+        db.flush()
+        cubre_por_dia.crear(db, vacacion.id, asignaciones)
     db.commit()
     db.refresh(vacacion)
     # Aviso a administración, después del commit y fuera de la petición: nunca rompe la solicitud
@@ -406,7 +509,15 @@ def pedir_vacaciones(
     if vacacion.cubre_clave:
         # Eligió quién la cubre: se le pide confirmar (CONFIRMO / NO PUEDO en su aviso)
         background_tasks.add_task(avisos.cubrir_solicitud, vacacion.cubre_clave, clave, inicio, fin, vacacion.id)
-    return _serializar(vacacion, {})
+    if asignaciones:
+        # Por día: a cada persona un solo aviso con SUS días
+        personas = {}
+        for fecha, quien in asignaciones:
+            if quien:
+                personas.setdefault(quien, []).append(fecha)
+        for quien, fechas in personas.items():
+            background_tasks.add_task(avisos.cubrir_dias, quien, clave, fechas, vacacion.id)
+    return serializar_con_dias(db, [vacacion])[0]
 
 
 @router.delete("/vacaciones/{vacacion_id}")
@@ -451,6 +562,11 @@ def cancelar_solicitud(
     datos_aviso = (vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.dias, vacacion.id)
     # Quien la iba a cubrir (salvo que ya hubiera dicho que no puede) recibe "Ya no tienes que cubrir..."
     cubre = vacacion.cubre_clave if vacacion.cubre_confirmado is not False else None
+    # Por día: cada persona con sus días (los que no rechazó)
+    por_persona = cubre_por_dia.por_persona(
+        f for f in cubre_por_dia.dias_de_una(db, vacacion.id) if f.confirmado is not False
+    )
+    cubre_por_dia.borrar(db, vacacion.id)
     db.delete(vacacion)
     db.commit()
     background_tasks.add_task(avisos.solicitud_cancelada, *datos_aviso)
@@ -458,4 +574,6 @@ def cancelar_solicitud(
         background_tasks.add_task(
             avisos.cobertura_cancelada, cubre, datos_aviso[0], datos_aviso[2], datos_aviso[3], datos_aviso[5]
         )
+    for quien, fechas in por_persona.items():
+        background_tasks.add_task(avisos.cobertura_cancelada_dias, quien, datos_aviso[0], fechas, datos_aviso[5])
     return {"ok": True}

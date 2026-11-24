@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from app import avisos, models
+from app import avisos, cubre_por_dia, models
 from app.database import get_db
 from app.utilidades import verificar_rol_requerido
 
@@ -26,6 +26,14 @@ NIVELES = ("rh", "encargado", "gerencia")
 TIPOS_CON_APROBACION = ("vacaciones", "dia_extra")
 
 solo_admin = verificar_rol_requerido(models.RolEnum.admin)
+
+
+class CubreDiaResponse(BaseModel):
+    fecha: date
+    cubre_clave: Optional[str] = None  # None = "No tengo quién me cubra" ese día
+    confirmado: Optional[bool] = None
+    confirmado_por: Optional[str] = None
+    confirmado_at: Optional[datetime] = None
 
 
 class VacacionResponse(BaseModel):
@@ -52,6 +60,8 @@ class VacacionResponse(BaseModel):
     cubre_confirmado: Optional[bool] = None
     cubre_confirmado_por: Optional[str] = None
     cubre_confirmado_at: Optional[datetime] = None
+    # Quién cubre cada día (solo si eligió gente distinta por día; vacío = como siempre, cubre_clave)
+    cubre_por_dia: List[CubreDiaResponse] = []
 
 
 class SolicitudResponse(VacacionResponse):
@@ -204,11 +214,15 @@ class AprobacionBody(BaseModel):
 
 class CubreBody(BaseModel):
     cubre_clave: Optional[str]
+    # Solo en solicitudes por día: cambia quién cubre ESA fecha
+    fecha: Optional[date] = None
 
 
 class ConfirmacionCubreBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     confirmo: bool
+    # Solo en solicitudes por día: confirma los días de esa persona
+    cubre_clave: Optional[str] = Field(None, max_length=50)
 
 
 def _normalizar(clave: Optional[str]) -> str:
@@ -235,13 +249,18 @@ def _usuario_activo(db: Session, clave: str) -> Optional[models.Usuario]:
     )
 
 
-def _nombres_aprobadores(db: Session, vacaciones: Iterable[models.Vacacion]) -> Dict[int, str]:
+def _nombres_aprobadores(
+    db: Session,
+    vacaciones: Iterable[models.Vacacion],
+    dias: Optional[Dict[int, List[models.VacacionCubre]]] = None,
+) -> Dict[int, str]:
     vacaciones = list(vacaciones)
     ids = {
         getattr(v, f"aprobado_{nivel}_por")
         for v in vacaciones
         for nivel in NIVELES
     } | {v.cubre_confirmado_por for v in vacaciones}
+    ids |= {f.confirmado_por for filas in (dias or {}).values() for f in filas}
     ids -= {None}
     if not ids:
         return {}
@@ -253,7 +272,7 @@ def _nombres_aprobadores(db: Session, vacaciones: Iterable[models.Vacacion]) -> 
     return {f.id: (f.nombre_englobado or "").strip() or f.username for f in filas}
 
 
-def _serializar(v: models.Vacacion, nombres: Dict[int, str]) -> dict:
+def _serializar(v: models.Vacacion, nombres: Dict[int, str], dias: Optional[List[models.VacacionCubre]] = None) -> dict:
     datos = {
         "id": v.id,
         "clave": v.clave,
@@ -274,7 +293,25 @@ def _serializar(v: models.Vacacion, nombres: Dict[int, str]) -> dict:
     datos["cubre_confirmado"] = v.cubre_confirmado
     datos["cubre_confirmado_por"] = nombres.get(v.cubre_confirmado_por) if v.cubre_confirmado_por is not None else None
     datos["cubre_confirmado_at"] = v.cubre_confirmado_at
+    datos["cubre_por_dia"] = [
+        {
+            "fecha": f.fecha,
+            "cubre_clave": (f.cubre_clave or "").strip() or None,
+            "confirmado": f.confirmado,
+            "confirmado_por": nombres.get(f.confirmado_por) if f.confirmado_por is not None else None,
+            "confirmado_at": f.confirmado_at,
+        }
+        for f in (dias or [])
+    ]
     return datos
+
+
+def serializar_con_dias(db: Session, vacaciones: Iterable[models.Vacacion]) -> List[dict]:
+    """_serializar de varias solicitudes con sus días de quién cubre (1 consulta para todas)."""
+    vacaciones = list(vacaciones)
+    dias = cubre_por_dia.dias_de(db, [v.id for v in vacaciones])
+    nombres = _nombres_aprobadores(db, vacaciones, dias)
+    return [_serializar(v, nombres, dias.get(v.id)) for v in vacaciones]
 
 
 def _obtener_vacacion(db: Session, vacacion_id: int, bloquear: bool = False) -> models.Vacacion:
@@ -300,8 +337,7 @@ def listar_vacaciones(
         .order_by(models.Vacacion.fecha_inicio, models.Vacacion.id)
         .all()
     )
-    nombres = _nombres_aprobadores(db, vacaciones)
-    return [_serializar(v, nombres) for v in vacaciones]
+    return serializar_con_dias(db, vacaciones)
 
 
 @router.get("/solicitudes", response_model=List[SolicitudResponse])
@@ -334,14 +370,13 @@ def listar_solicitudes(
     nombre_por_clave = {f.clave: f.nombre_completo for f in filas}
     saldos = _saldos_solicitudes(db, vacaciones)
 
-    nombres = _nombres_aprobadores(db, vacaciones)
     return [
         {
-            **_serializar(v, nombres),
+            **datos,
             "nombre_completo": nombre_por_clave.get(_normalizar(v.clave)),
             **saldos.get(v.id, _SALDO_VACIO),
         }
-        for v in vacaciones
+        for v, datos in zip(vacaciones, serializar_con_dias(db, vacaciones))
     ]
 
 
@@ -1347,16 +1382,21 @@ def es_pendiente_con_aprobacion(v: models.Vacacion) -> bool:
     return v.tipo in TIPOS_CON_APROBACION and (v.estado or "").strip().lower() == "solicitada"
 
 
-def autorizar_si_completa(v: models.Vacacion) -> bool:
+def autorizar_si_completa(v: models.Vacacion, dias: Optional[List[models.VacacionCubre]] = None) -> bool:
     """Pasa a 'autorizada' solo con los 4 en verde: RH, Encargado, Gerencia y quien cubre
-    confirmó. Devuelve True si la autorizó en esta llamada. Llamar con la fila bloqueada."""
+    confirmó. Devuelve True si la autorizó en esta llamada. Llamar con la fila bloqueada.
+    Con días por persona (dias), quien cubre está en verde solo si TODOS los días tienen
+    persona y todas confirmaron; sin días, la regla de siempre (cubre_clave confirmado)."""
+    if dias:
+        cubre_ok = cubre_por_dia.completo(dias)
+    else:
+        cubre_ok = bool(_normalizar(v.cubre_clave)) and v.cubre_confirmado is True
     completa = (
         es_pendiente_con_aprobacion(v)
         and v.aprobado_rh is True
         and v.aprobado_encargado is True
         and v.aprobado_gerencia is True
-        and bool(_normalizar(v.cubre_clave))
-        and v.cubre_confirmado is True
+        and cubre_ok
     )
     if completa:
         v.estado = "autorizada"
@@ -1396,7 +1436,7 @@ def aplicar_aprobacion(
         # Gerencia rechaza: se rechaza de inmediato, como siempre
         vacacion.estado = "rechazada"
     # Se autoriza solo con los 4 en verde (RH, Encargado, Gerencia y quien cubre confirmó)
-    autorizada = autorizar_si_completa(vacacion)
+    autorizada = autorizar_si_completa(vacacion, cubre_por_dia.dias_de_una(db, vacacion.id))
 
     db.commit()
     db.refresh(vacacion)
@@ -1426,7 +1466,7 @@ def registrar_aprobacion(
 ):
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
     aplicar_aprobacion(db, vacacion, body.nivel, body.aprobado, admin, background_tasks)
-    return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
+    return serializar_con_dias(db, [vacacion])[0]
 
 
 @router.patch("/{vacacion_id}/cubre", response_model=VacacionResponse)
@@ -1438,18 +1478,43 @@ def asignar_cubre(
     _admin: models.Usuario = Depends(solo_admin),
 ):
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
-    anterior = _normalizar(vacacion.cubre_clave)
-    confirmado_antes = vacacion.cubre_confirmado
+    dias = cubre_por_dia.dias_de_una(db, vacacion.id)
+    if body.fecha is not None:
+        return _asignar_cubre_dia(db, vacacion, dias, body, background_tasks)
 
-    if body.cubre_clave is None:
-        vacacion.cubre_clave = None
-    else:
-        usuario = _usuario_activo(db, body.cubre_clave)
-        if usuario is None:
+    nuevo_usuario = None
+    if body.cubre_clave is not None:
+        nuevo_usuario = _usuario_activo(db, body.cubre_clave)
+        if nuevo_usuario is None:
             raise HTTPException(status_code=400, detail="La clave no corresponde a un usuario activo")
         if _normalizar(body.cubre_clave) == _normalizar(vacacion.clave):
             raise HTTPException(status_code=400, detail="La persona no puede cubrirse a si misma")
-        vacacion.cubre_clave = usuario.nombre_englobado.strip()
+
+    if dias:
+        # Tenía quién cubre por día y admin elige UNA persona para todos: vuelve al modo de siempre
+        if not es_pendiente_con_aprobacion(vacacion):
+            raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
+        confirmados = cubre_por_dia.por_persona(f for f in dias if f.confirmado is True)
+        cubre_por_dia.borrar(db, vacacion.id)
+        vacacion.cubre_clave = nuevo_usuario.nombre_englobado.strip() if nuevo_usuario else None
+        vacacion.cubre_confirmado = None
+        vacacion.cubre_confirmado_por = None
+        vacacion.cubre_confirmado_at = None
+        db.commit()
+        db.refresh(vacacion)
+        nuevo = _normalizar(vacacion.cubre_clave)
+        if nuevo:
+            background_tasks.add_task(
+                avisos.cubrir_solicitud, nuevo, vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
+            )
+        for clave, fechas in confirmados.items():
+            if clave != nuevo:
+                background_tasks.add_task(avisos.cobertura_cancelada_dias, clave, vacacion.clave, fechas, vacacion.id)
+        return serializar_con_dias(db, [vacacion])[0]
+
+    anterior = _normalizar(vacacion.cubre_clave)
+    confirmado_antes = vacacion.cubre_confirmado
+    vacacion.cubre_clave = nuevo_usuario.nombre_englobado.strip() if nuevo_usuario else None
 
     nuevo = _normalizar(vacacion.cubre_clave)
     # Pendiente y cambió la persona: se reinicia la confirmación y se avisa a la nueva.
@@ -1469,18 +1534,83 @@ def asignar_cubre(
         if anterior and confirmado_antes is True:
             # Ya había confirmado: que sepa que ya no cubre
             background_tasks.add_task(avisos.cobertura_cancelada, anterior, *fechas)
-    return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
+    return serializar_con_dias(db, [vacacion])[0]
+
+
+def _asignar_cubre_dia(
+    db: Session,
+    vacacion: models.Vacacion,
+    dias: List[models.VacacionCubre],
+    body: CubreBody,
+    background_tasks: BackgroundTasks,
+):
+    # Solo admin reasigna un día (p. ej. cuando alguien dijo "no puedo"); la fila ya está bloqueada
+    if not dias:
+        raise HTTPException(status_code=409, detail="Esta solicitud no tiene quién cubre por día")
+    if not es_pendiente_con_aprobacion(vacacion):
+        raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
+    fila = next((f for f in dias if f.fecha == body.fecha), None)
+    if fila is None:
+        raise HTTPException(status_code=400, detail="Esa fecha no es parte de la solicitud")
+
+    nuevo_usuario = None
+    if _normalizar(body.cubre_clave):
+        nuevo_usuario = _usuario_activo(db, body.cubre_clave)
+        if nuevo_usuario is None:
+            raise HTTPException(status_code=400, detail="La clave no corresponde a un usuario activo")
+        if _normalizar(body.cubre_clave) == _normalizar(vacacion.clave):
+            raise HTTPException(status_code=400, detail="La persona no puede cubrirse a si misma")
+
+    anterior = _normalizar(fila.cubre_clave)
+    confirmado_antes = fila.confirmado
+    nuevo = _normalizar(nuevo_usuario.nombre_englobado) if nuevo_usuario else ""
+    cambio = nuevo != anterior
+    if cambio:
+        fila.cubre_clave = nuevo_usuario.nombre_englobado.strip() if nuevo_usuario else None
+        fila.confirmado = None
+        fila.confirmado_por = None
+        fila.confirmado_at = None
+        cubre_por_dia.sincronizar(vacacion, dias)
+    db.commit()
+    db.refresh(vacacion)
+    if cambio:
+        if nuevo:
+            background_tasks.add_task(avisos.cubrir_dias, nuevo, vacacion.clave, [body.fecha], vacacion.id)
+        if anterior and confirmado_antes is True:
+            background_tasks.add_task(avisos.cobertura_cancelada_dias, anterior, vacacion.clave, [body.fecha], vacacion.id)
+    return serializar_con_dias(db, [vacacion])[0]
 
 
 @router.post("/{vacacion_id}/cubre/recordatorio")
 def recordar_cubre(
     vacacion_id: int,
     background_tasks: BackgroundTasks,
+    cubre_clave: Optional[str] = Query(None, max_length=50),
     db: Session = Depends(get_db),
     _admin: models.Usuario = Depends(solo_admin),
 ):
     # Vuelve a mandar "¿Confirmas que vas a cubrir...?" (sirve para las solicitudes de antes del flujo)
     vacacion = _obtener_vacacion(db, vacacion_id)
+    dias = cubre_por_dia.dias_de_una(db, vacacion.id)
+    if dias:
+        # Por día: a una persona, con sus días que siguen sin respuesta
+        cubre = _normalizar(cubre_clave)
+        if not cubre:
+            raise HTTPException(status_code=400, detail="Indica a quién reenviar el aviso (cubre_clave)")
+        mias = cubre_por_dia.de_persona(dias, cubre)
+        if not es_pendiente_con_aprobacion(vacacion) or not mias:
+            raise HTTPException(status_code=409, detail="La solicitud no está pendiente o esa persona no cubre ningún día")
+        pendientes = [f.fecha for f in mias if f.confirmado is None]
+        if not pendientes:
+            raise HTTPException(status_code=409, detail="Quien cubre ya respondió")
+        if cubre not in avisos.claves_con_mensajes(db):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{cubre} todavía no tiene MENSAJES: usa Confirmar por él si ya te confirmó",
+            )
+        background_tasks.add_task(avisos.cubrir_dias, cubre, vacacion.clave, pendientes, vacacion.id)
+        return {"ok": True}
+
     cubre = _normalizar(vacacion.cubre_clave)
     if not es_pendiente_con_aprobacion(vacacion) or not cubre:
         raise HTTPException(status_code=409, detail="La solicitud no está pendiente o no tiene quién cubre")
@@ -1507,17 +1637,27 @@ def confirmar_cubre_por_admin(
 ):
     # "Confirmar por él": quien cubre avisó por otro medio (teléfono, en persona)
     vacacion = _obtener_vacacion(db, vacacion_id, bloquear=True)
-    if not es_pendiente_con_aprobacion(vacacion) or not _normalizar(vacacion.cubre_clave):
-        raise HTTPException(status_code=409, detail="La solicitud no está pendiente o no tiene quién cubre")
-    registrar_respuesta_cubre(vacacion, body.confirmo, admin.id)
-    autorizada = autorizar_si_completa(vacacion)
+    dias = cubre_por_dia.dias_de_una(db, vacacion.id)
+    if dias:
+        if not _normalizar(body.cubre_clave):
+            raise HTTPException(status_code=400, detail="Indica de quién es la confirmación (cubre_clave)")
+        mias = cubre_por_dia.de_persona(dias, body.cubre_clave)
+        if not es_pendiente_con_aprobacion(vacacion) or not mias:
+            raise HTTPException(status_code=409, detail="La solicitud no está pendiente o esa persona no cubre ningún día")
+        cubre_por_dia.responder(mias, body.confirmo, admin.id)
+        cubre_por_dia.sincronizar(vacacion, dias)
+    else:
+        if not es_pendiente_con_aprobacion(vacacion) or not _normalizar(vacacion.cubre_clave):
+            raise HTTPException(status_code=409, detail="La solicitud no está pendiente o no tiene quién cubre")
+        registrar_respuesta_cubre(vacacion, body.confirmo, admin.id)
+    autorizada = autorizar_si_completa(vacacion, dias)
     db.commit()
     db.refresh(vacacion)
     if autorizada:
         background_tasks.add_task(
             avisos.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id
         )
-    return _serializar(vacacion, _nombres_aprobadores(db, [vacacion]))
+    return serializar_con_dias(db, [vacacion])[0]
 
 
 @router.delete("/{vacacion_id}")

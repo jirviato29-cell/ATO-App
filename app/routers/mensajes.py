@@ -15,7 +15,7 @@ from sqlalchemy import false, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app import avisos as avisos_auto
-from app import models, permisos_vacaciones
+from app import cubre_por_dia, models, permisos_vacaciones
 from app.avisos import clave_de, claves_con_mensajes, es_admin, normalizar, tiene_mensajes
 from app.routers.vacaciones import autorizar_si_completa, es_pendiente_con_aprobacion, registrar_respuesta_cubre
 from app.config import get_current_user
@@ -173,16 +173,27 @@ def listar_avisos(
     # Avisos de cobertura: si todavía puede responder (1 consulta para toda la página)
     ids = {a.vacacion_id for a in filas if a.tipo == "cubrir_solicitud" and a.vacacion_id}
     vacs = {v.id: v for v in db.query(models.Vacacion).filter(models.Vacacion.id.in_(ids)).all()} if ids else {}
+    # Solicitudes con quién cubre por día: cada quien responde solo por sus días
+    dias = cubre_por_dia.dias_de(db, ids) if ids else {}
     salida = []
     for a in filas:
         datos = AvisoResponse.model_validate(a, from_attributes=True).model_dump()
         if a.tipo == "cubrir_solicitud" and a.vacacion_id:
             v = vacs.get(a.vacacion_id)
-            sigue = v is not None and normalizar(v.cubre_clave) == normalizar(a.para_clave)
+            filas_dia = dias.get(a.vacacion_id)
+            if filas_dia:
+                mias = cubre_por_dia.de_persona(filas_dia, a.para_clave)
+                sigue = v is not None and bool(mias)
+                pendiente = any(f.confirmado is None for f in mias)
+                respuesta = cubre_por_dia.respuesta_de(mias) if sigue else None
+            else:
+                sigue = v is not None and normalizar(v.cubre_clave) == normalizar(a.para_clave)
+                pendiente = sigue and v.cubre_confirmado is None
+                respuesta = v.cubre_confirmado if sigue else None
             datos["cobertura"] = {
                 "vacacion_id": a.vacacion_id,
-                "puede_responder": bool(sigue and es_pendiente_con_aprobacion(v) and v.cubre_confirmado is None),
-                "respuesta": v.cubre_confirmado if sigue else None,
+                "puede_responder": bool(sigue and es_pendiente_con_aprobacion(v) and pendiente),
+                "respuesta": respuesta,
             }
         salida.append(datos)
     return salida
@@ -428,14 +439,30 @@ def responder_cobertura(
     vacacion = (
         db.query(models.Vacacion).filter(models.Vacacion.id == vacacion_id).with_for_update().first()
     )
-    if vacacion is None or es_admin(usuario) or normalizar(vacacion.cubre_clave) != clave_de(usuario):
-        raise HTTPException(status_code=403, detail="No te toca responder esta cobertura")
-    if not es_pendiente_con_aprobacion(vacacion):
-        raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
-    if vacacion.cubre_confirmado is not None:
-        raise HTTPException(status_code=409, detail="Ya respondiste esta cobertura")
-    registrar_respuesta_cubre(vacacion, body.confirmo, usuario.id)
-    autorizada = autorizar_si_completa(vacacion)
+    # Por día (después del candado de la solicitud): solo los días de quien responde
+    dias = cubre_por_dia.dias_de_una(db, vacacion_id) if vacacion is not None else []
+    if dias:
+        mias = cubre_por_dia.de_persona(dias, clave_de(usuario))
+        if es_admin(usuario) or not mias:
+            raise HTTPException(status_code=403, detail="No te toca responder esta cobertura")
+        if not es_pendiente_con_aprobacion(vacacion):
+            raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
+        pendientes = [f for f in mias if f.confirmado is None]
+        if not pendientes:
+            raise HTTPException(status_code=409, detail="Ya respondiste esta cobertura")
+        cubre_por_dia.responder(pendientes, body.confirmo, usuario.id)
+        cubre_por_dia.sincronizar(vacacion, dias)
+        fechas_respondidas = [f.fecha for f in pendientes]
+    else:
+        if vacacion is None or es_admin(usuario) or normalizar(vacacion.cubre_clave) != clave_de(usuario):
+            raise HTTPException(status_code=403, detail="No te toca responder esta cobertura")
+        if not es_pendiente_con_aprobacion(vacacion):
+            raise HTTPException(status_code=409, detail="La solicitud ya no está pendiente")
+        if vacacion.cubre_confirmado is not None:
+            raise HTTPException(status_code=409, detail="Ya respondiste esta cobertura")
+        registrar_respuesta_cubre(vacacion, body.confirmo, usuario.id)
+        fechas_respondidas = None
+    autorizada = autorizar_si_completa(vacacion, dias)
     # El aviso de la pregunta queda leído
     (
         db.query(models.Aviso)
@@ -451,7 +478,14 @@ def responder_cobertura(
     db.refresh(vacacion)
     datos = (vacacion.clave, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id)
     if not body.confirmo:
-        background_tasks.add_task(avisos_auto.cubre_no_puede, clave_de(usuario), *datos)
+        # A administración y al empleado; solo admin reasigna
+        if fechas_respondidas is not None:
+            background_tasks.add_task(
+                avisos_auto.cubre_no_puede_dias, clave_de(usuario), vacacion.clave, fechas_respondidas, vacacion.id
+            )
+        else:
+            background_tasks.add_task(avisos_auto.cubre_no_puede, clave_de(usuario), *datos)
+            background_tasks.add_task(avisos_auto.cubre_no_puede_al_empleado, clave_de(usuario), *datos)
     if autorizada:
         background_tasks.add_task(
             avisos_auto.solicitud_aprobada, vacacion.clave, vacacion.tipo, vacacion.fecha_inicio, vacacion.fecha_fin, vacacion.id

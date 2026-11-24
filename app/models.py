@@ -1028,3 +1028,19 @@ class Mensaje(BaseManual):
     lote = Column(Uuid(as_uuid=False))  # mismo valor en los renglones de un "a todos"
     creado_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     leido_at = Column(DateTime(timezone=True))  # lo leyó el otro lado
+
+
+class VacacionCubre(BaseManual):
+    # Quién cubre CADA día de una solicitud. Tabla hecha a mano en Supabase (vacaciones_cubre,
+    # FK a vacaciones con ON DELETE CASCADE y UNIQUE(vacacion_id, fecha)). Solo hay filas cuando
+    # la persona eligió gente distinta para distintos días; si no, sigue vacaciones.cubre_clave.
+    __tablename__ = "vacaciones_cubre"
+
+    id = Column(Integer, primary_key=True)
+    vacacion_id = Column(Integer, nullable=False)  # sin FK aquí: vacaciones vive en otra Base
+    fecha = Column(Date, nullable=False)
+    cubre_clave = Column(String(50))  # nombre_englobado; NULL = "No tengo quién me cubra" ese día
+    confirmado = Column(Boolean)  # NULL sin respuesta, true confirmó, false no puede
+    confirmado_por = Column(Integer)  # usuarios.id de quien respondió (quien cubre o un admin)
+    confirmado_at = Column(DateTime(timezone=True))
+    creado_at = Column(DateTime(timezone=True), server_default=func.now())

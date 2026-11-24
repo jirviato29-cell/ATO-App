@@ -336,3 +336,90 @@ def cobertura_cancelada(cubre: str, clave: str, inicio: date, fin: date, vacacio
         }],
         solo_si_tiene_acceso=cubre,
     )
+
+
+
+# --------------- Quién cubre por día (app/cubre_por_dia.py) ---------------
+# Mismos tipos de aviso que el flujo de siempre: la tabla avisos no cambia.
+
+def _texto_dias(fechas) -> str:
+    """[01/12, 02/12, 04/12] -> 'del 01/12 al 02/12 y el 04/12'"""
+    tramos = []
+    for d in sorted(set(fechas)):
+        if tramos and (d - tramos[-1][1]).days == 1:
+            tramos[-1][1] = d
+        else:
+            tramos.append([d, d])
+    partes = [f"el {_dm(a)}" if a == b else f"del {_dm(a)} al {_dm(b)}" for a, b in tramos]
+    if not partes:
+        return ""
+    return partes[0] if len(partes) == 1 else ", ".join(partes[:-1]) + " y " + partes[-1]
+
+
+@_seguro
+def cubrir_dias(cubre: str, clave: str, fechas, vacacion_id: int) -> None:
+    # Igual que cubrir_solicitud, solo con SUS días (CONFIRMO / NO PUEDO en su aviso)
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    _guardar(
+        [{
+            "para_clave": cubre,
+            "tipo": "cubrir_solicitud",
+            "texto": f"¿Confirmas que vas a cubrir a {clave} {_texto_dias(fechas)}?",
+            "enlace": None,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=cubre,
+    )
+
+
+def _no_puede_al_empleado(cubre: str, clave: str, cuando: str, vacacion_id: int) -> None:
+    _guardar(
+        [{
+            "para_clave": clave,
+            "tipo": "cubre_no_puede",
+            "texto": f"{cubre} no puede cubrirte {cuando}; administración elegirá a otra persona",
+            "enlace": ENLACE_SOLICITUDES,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=clave,
+    )
+
+
+@_seguro
+def cubre_no_puede_al_empleado(cubre: str, clave: str, inicio: date, fin: date, vacacion_id: int) -> None:
+    # Flujo de una sola persona: administración ya recibe cubre_no_puede; esto es para el empleado
+    _no_puede_al_empleado(normalizar(cubre), normalizar(clave), _del(inicio, fin), vacacion_id)
+
+
+@_seguro
+def cubre_no_puede_dias(cubre: str, clave: str, fechas, vacacion_id: int) -> None:
+    # A administración (bandeja compartida) y al empleado; solo admin reasigna esos días
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    cuando = _texto_dias(fechas)
+    _guardar([{
+        "para_clave": None,
+        "tipo": "cubre_no_puede",
+        "texto": f"{cubre} no puede cubrir a {clave} {cuando}; elige a otra persona",
+        "enlace": ENLACE_SOLICITUDES,
+        "sobre_clave": clave,
+        "vacacion_id": vacacion_id,
+    }])
+    _no_puede_al_empleado(cubre, clave, cuando, vacacion_id)
+
+
+@_seguro
+def cobertura_cancelada_dias(cubre: str, clave: str, fechas, vacacion_id: int) -> None:
+    cubre, clave = normalizar(cubre), normalizar(clave)
+    _guardar(
+        [{
+            "para_clave": cubre,
+            "tipo": "cobertura_cancelada",
+            "texto": f"Ya no tienes que cubrir a {clave} {_texto_dias(fechas)}",
+            "enlace": None,
+            "sobre_clave": clave,
+            "vacacion_id": vacacion_id,
+        }],
+        solo_si_tiene_acceso=cubre,
+    )
