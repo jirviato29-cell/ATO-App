@@ -208,7 +208,7 @@ def modulos_de_grupos_vacaciones() -> set:
     return nombres
 
 
-def _en_grupo_vacaciones(db: Session, usuario: models.Usuario) -> bool:
+def en_grupo_vacaciones(db: Session, usuario: models.Usuario) -> bool:
     nombres = modulos_de_grupos_vacaciones()
     if not nombres:
         return False
@@ -218,12 +218,22 @@ def _en_grupo_vacaciones(db: Session, usuario: models.Usuario) -> bool:
     return principal.modulo is not None and principal.modulo.nombre in nombres
 
 
+def claves_en_grupos_vacaciones(db: Session) -> set:
+    """Claves de todas las personas activas de los grupos encendidos (para MENSAJES y avisos)."""
+    from app.permisos_vacaciones import personas_activas
+
+    nombres = modulos_de_grupos_vacaciones()
+    if not nombres:
+        return set()
+    return {c for c, p in personas_activas(db).items() if p.modulo in nombres}
+
+
 def tiene_mis_vacaciones(usuario: models.Usuario, db: Session) -> bool:
     if _es_piloto(usuario):
         return True
     if not (bool(usuario.activo) and usuario.rol in ROLES_EMPLEADO):
         return False
-    return vacaciones_para_todos() or _en_grupo_vacaciones(db, usuario)
+    return vacaciones_para_todos() or en_grupo_vacaciones(db, usuario)
 
 
 def _exigir_piloto(usuario: models.Usuario, db: Session) -> None:

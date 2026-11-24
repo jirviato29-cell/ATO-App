@@ -134,6 +134,42 @@ def es_revisor(db: Session, usuario: models.Usuario) -> bool:
     return alcance(db, usuario).es_revisor
 
 
+@dataclass
+class PersonaActiva:
+    clave: str
+    modulo: Optional[str]  # nombre del módulo de su cuenta PRINCIPAL (None si no tiene)
+    es_encargado: bool  # alguna cuenta activa de rol encargado
+
+
+def personas_activas(db: Session) -> Dict[str, PersonaActiva]:
+    """Una entrada por persona (clave = englobado o username) con cuentas activas de empleado.
+
+    Misma regla de cuenta principal que saldo, permisos y Mis vacaciones: la primera
+    cuenta (por id) con sueldo > 0; si ninguna, la primera.
+    """
+    from app.routers.vacaciones import _principal
+
+    por_clave: Dict[str, List[models.Usuario]] = {}
+    for u in (
+        db.query(models.Usuario)
+        .filter(models.Usuario.activo == True, models.Usuario.rol.in_(ROLES_EMPLEADO))  # noqa: E712
+        .order_by(models.Usuario.id)
+        .all()
+    ):
+        clave = clave_de(u)
+        if clave:
+            por_clave.setdefault(clave, []).append(u)
+    nombres = dict(db.query(models.Modulo.id, models.Modulo.nombre).all())
+    return {
+        clave: PersonaActiva(
+            clave=clave,
+            modulo=nombres.get(_principal(cuentas).modulo_id),
+            es_encargado=any(c.rol == models.RolEnum.encargado for c in cuentas),
+        )
+        for clave, cuentas in por_clave.items()
+    }
+
+
 def modulos_principales(db: Session, claves: Iterable[str]) -> Dict[str, Optional[int]]:
     """clave de empleado -> modulo_id de su cuenta principal (None si no tiene)."""
     # Import tardío: vacaciones importa avisos, y avisos importa este archivo

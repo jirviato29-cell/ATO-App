@@ -59,6 +59,13 @@ def tiene_mensajes(usuario: models.Usuario, db: Optional[Session] = None) -> boo
             return True
     elif normalizar(usuario.username) in _usernames_piloto():
         return True
+    # Grupos con Mis vacaciones abierta (VACACIONES_GRUPOS, p. ej. cadenas) también tienen
+    # MENSAJES: ahí les llegan los avisos de sus solicitudes.
+    if db is not None and usuario.activo and usuario.rol in ROLES_EMPLEADO:
+        from app.routers.mi_perfil import en_grupo_vacaciones
+
+        if en_grupo_vacaciones(db, usuario):
+            return True
     # RH y encargados (incluidas asignaciones manuales) tienen MENSAJES siempre:
     # ahí les llegan las solicitudes que revisan.
     if db is not None:
@@ -71,17 +78,19 @@ def tiene_mensajes(usuario: models.Usuario, db: Optional[Session] = None) -> boo
 def claves_con_mensajes(db: Session) -> Set[str]:
     # Claves de empleado que hoy pueden ver MENSAJES (destinatarios de "a todos" y de avisos)
     from app.permisos_vacaciones import claves_revisoras
+    from app.routers.mi_perfil import claves_en_grupos_vacaciones
 
-    revisores = claves_revisoras(db)
+    # RH, encargados y grupos de VACACIONES_GRUPOS: siempre, esté como esté MENSAJES_PARA_TODOS
+    fijos = claves_revisoras(db) | claves_en_grupos_vacaciones(db)
     q = db.query(models.Usuario).filter(models.Usuario.activo == True)  # noqa: E712
     if mensajes_para_todos():
         q = q.filter(models.Usuario.rol.in_(ROLES_EMPLEADO))
     else:
         pilotos = _usernames_piloto()
         if not pilotos:
-            return revisores
+            return fijos
         q = q.filter(func.upper(func.trim(models.Usuario.username)).in_(pilotos))
-    return {c for c in (clave_de(u) for u in q.all() if not es_admin(u)) if c} | revisores
+    return {c for c in (clave_de(u) for u in q.all() if not es_admin(u)) if c} | fijos
 
 
 # ------------------------------- textos -------------------------------

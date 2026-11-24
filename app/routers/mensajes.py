@@ -388,6 +388,77 @@ def escribir_a_todos(
     return {"enviados": len(claves)}
 
 
+# ------------------------------- escribir por grupo -------------------------------
+# Personas activas (una vez cada una aunque tenga varias cuentas), por su cuenta PRINCIPAL:
+# - cadenas: principal en un módulo de Cadenas (los promotores C-)
+# - encargados: alguna cuenta activa de rol encargado
+# - asesores: los demás (principal fuera de Cadenas, sin cuenta de encargado; BO incluido)
+# Igual que "Escribir a todos", solo le llega a quien hoy tiene MENSAJES.
+GRUPOS_MENSAJES = {"cadenas": "Cadenas", "asesores": "Asesores", "encargados": "Encargados"}
+
+
+def personas_por_grupo(db: Session) -> dict:
+    from app.routers.mi_perfil import GRUPOS_VACACIONES
+
+    modulos_cadenas = set(GRUPOS_VACACIONES["cadenas"])
+    grupos = {g: set() for g in GRUPOS_MENSAJES}
+    for clave, p in permisos_vacaciones.personas_activas(db).items():
+        if p.es_encargado:
+            grupos["encargados"].add(clave)
+        elif p.modulo in modulos_cadenas:
+            grupos["cadenas"].add(clave)
+        else:
+            grupos["asesores"].add(clave)
+    return grupos
+
+
+class GrupoResponse(BaseModel):
+    grupo: str
+    titulo: str
+    # Les llega el mensaje (tienen MENSAJES)
+    personas: int
+    claves: List[str]
+    # Todas las del grupo, tengan o no MENSAJES
+    en_grupo: int
+
+
+@router.get("/grupos", response_model=List[GrupoResponse])
+def listar_grupos(
+    db: Session = Depends(get_db),
+    admin: models.Usuario = Depends(solo_admin_mensajes),
+):
+    con_acceso = claves_con_mensajes(db)
+    salida = []
+    for grupo, claves in personas_por_grupo(db).items():
+        destino = sorted(claves & con_acceso)
+        salida.append({"grupo": grupo, "titulo": GRUPOS_MENSAJES[grupo], "personas": len(destino),
+                       "claves": destino, "en_grupo": len(claves)})
+    return salida
+
+
+@router.post("/grupos/{grupo}", response_model=EnviadoATodosResponse, status_code=201)
+def escribir_a_grupo(
+    grupo: str,
+    body: MensajeCrear,
+    db: Session = Depends(get_db),
+    admin: models.Usuario = Depends(solo_admin_mensajes),
+):
+    grupo = grupo.strip().lower()
+    if grupo not in GRUPOS_MENSAJES:
+        raise HTTPException(status_code=404, detail="Ese grupo no existe")
+    texto = _texto_limpio(body)
+    claves = sorted(personas_por_grupo(db)[grupo] & claves_con_mensajes(db))
+    if not claves:
+        raise HTTPException(status_code=400, detail=f"Nadie de {GRUPOS_MENSAJES[grupo]} tiene MENSAJES todavía")
+    lote, ahora = str(uuid.uuid4()), _ahora()
+    db.add_all(
+        models.Mensaje(clave=c, de_admin=True, autor_id=admin.id, texto=texto, lote=lote, creado_at=ahora)
+        for c in claves
+    )
+    db.commit()
+    return {"enviados": len(claves)}
+
+
 @router.get("/mi-conversacion", response_model=List[MensajeResponse])
 def mi_conversacion(
     antes_de: Optional[int] = Query(None, ge=1),
