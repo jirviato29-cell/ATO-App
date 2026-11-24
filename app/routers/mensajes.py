@@ -96,6 +96,8 @@ class ConversacionResponse(BaseModel):
     ultimo_texto: Optional[str] = None
     ultimo_at: Optional[datetime] = None
     ultimo_de_admin: Optional[bool] = None
+    # Si el último es de administración: cuándo lo abrió la persona (null = no lo ha visto)
+    ultimo_leido_at: Optional[datetime] = None
     no_leidos: int
 
 
@@ -331,6 +333,7 @@ def listar_conversaciones(
             "ultimo_texto": ultimo.texto if ultimo else None,
             "ultimo_at": ultimo.creado_at if ultimo else None,
             "ultimo_de_admin": ultimo.de_admin if ultimo else None,
+            "ultimo_leido_at": ultimo.leido_at if ultimo and ultimo.de_admin else None,
             "no_leidos": sin_leer,
         })
     # Primero lo que tiene pendiente, luego lo más reciente, luego por clave
