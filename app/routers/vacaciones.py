@@ -924,9 +924,9 @@ def periodos_guardados(db: Session, clave_norm: str) -> List[models.Vacacion]:
 # ni cuentan para "uno por mes" o los 15 días; sí para empalme y para el máximo
 # de 6 días seguidos junto con vacaciones.
 
-# Empleado: el día extra se pide con 5 días de anticipación (primer día = hoy + 5),
+# Empleado: el día extra se pide con 7 días de anticipación (primer día = hoy + 7),
 # cualquier día de la semana, y nunca del 15 de diciembre al 6 de enero (cada año).
-DIAS_ANTICIPACION_EXTRA = 5
+DIAS_ANTICIPACION_EXTRA = 7
 
 
 def dia_extra_bloqueado(d: date) -> bool:
@@ -1095,7 +1095,7 @@ def validar_dias_extra(
 
 
 def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date) -> None:
-    """Empleado: 5 días de anticipación, de lunes a domingo, sin 15 dic - 6 ene.
+    """Empleado: 7 días de anticipación, de lunes a domingo, sin 15 dic - 6 ene.
     La vigencia (festivo a vencimiento) la revisa validar_dias_extra."""
     primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION_EXTRA)
     if inicio < primer_dia:
