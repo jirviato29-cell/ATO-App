@@ -194,14 +194,40 @@ def _es_piloto(usuario: models.Usuario) -> bool:
     return _normalizar(usuario.username) in {_normalizar(u) for u in PILOTO_MI_PERFIL}
 
 
-def tiene_mis_vacaciones(usuario: models.Usuario) -> bool:
+# Interruptor por grupo en Render (VACACIONES_GRUPOS=cadenas): abre Mis vacaciones solo a
+# la gente de esos grupos aunque VACACIONES_PARA_TODOS esté apagada. Un grupo = módulos por
+# nombre; cuenta el módulo de la cuenta PRINCIPAL de la persona (misma regla que saldo,
+# permisos y "quién te cubre"). Varios grupos separados por coma. Se lee en cada llamada.
+GRUPOS_VACACIONES = {"cadenas": ("Cadenas C.",)}
+
+
+def modulos_de_grupos_vacaciones() -> set:
+    nombres = set()
+    for g in os.getenv("VACACIONES_GRUPOS", "").split(","):
+        nombres.update(GRUPOS_VACACIONES.get(g.strip().lower(), ()))
+    return nombres
+
+
+def _en_grupo_vacaciones(db: Session, usuario: models.Usuario) -> bool:
+    nombres = modulos_de_grupos_vacaciones()
+    if not nombres:
+        return False
+    englobado = _normalizar(usuario.nombre_englobado)
+    cuentas = _cuentas_por_clave(db, [englobado]).get(englobado, []) if englobado else []
+    principal = _principal(cuentas) or usuario
+    return principal.modulo is not None and principal.modulo.nombre in nombres
+
+
+def tiene_mis_vacaciones(usuario: models.Usuario, db: Session) -> bool:
     if _es_piloto(usuario):
         return True
-    return vacaciones_para_todos() and bool(usuario.activo) and usuario.rol in ROLES_EMPLEADO
+    if not (bool(usuario.activo) and usuario.rol in ROLES_EMPLEADO):
+        return False
+    return vacaciones_para_todos() or _en_grupo_vacaciones(db, usuario)
 
 
-def _exigir_piloto(usuario: models.Usuario) -> None:
-    if not tiene_mis_vacaciones(usuario):
+def _exigir_piloto(usuario: models.Usuario, db: Session) -> None:
+    if not tiene_mis_vacaciones(usuario, db):
         raise HTTPException(status_code=403, detail="Esta función todavía no está disponible para tu usuario")
 
 
@@ -210,9 +236,12 @@ class AccesoResponse(BaseModel):
 
 
 @router.get("/acceso", response_model=AccesoResponse)
-def mi_acceso(usuario: models.Usuario = Depends(get_current_user)):
-    # El frontend pregunta aquí si muestra "MIS VACACIONES": así manda el interruptor de Render
-    return {"mis_vacaciones": tiene_mis_vacaciones(usuario)}
+def mi_acceso(
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(get_current_user),
+):
+    # El frontend pregunta aquí si muestra "MIS VACACIONES": así mandan los interruptores de Render
+    return {"mis_vacaciones": tiene_mis_vacaciones(usuario, db)}
 
 
 @router.get("/dias-extra", response_model=DiasExtraResponse)
@@ -337,7 +366,7 @@ def cubre_opciones(
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(get_current_user),
 ):
-    _exigir_piloto(usuario)
+    _exigir_piloto(usuario, db)
     if fin < inicio:
         raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
     return opciones_cubre(db, _normalizar(usuario.nombre_englobado), inicio, fin)
@@ -359,7 +388,7 @@ def cubre_opciones_por_dia(
     usuario: models.Usuario = Depends(get_current_user),
 ):
     # Para "Cubrir por día": la lista de cada fecha (misma regla que /cubre-opciones)
-    _exigir_piloto(usuario)
+    _exigir_piloto(usuario, db)
     if fin < inicio:
         raise HTTPException(status_code=400, detail="La fecha final no puede ser anterior a la fecha de inicio")
     if (fin - inicio).days + 1 > MAX_DIAS_CUBRE_POR_DIA:
@@ -375,7 +404,7 @@ def pedir_vacaciones(
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(get_current_user),
 ):
-    _exigir_piloto(usuario)
+    _exigir_piloto(usuario, db)
 
     clave = (usuario.nombre_englobado or "").strip()
     if not clave:
@@ -527,7 +556,7 @@ def cancelar_solicitud(
     db: Session = Depends(get_db),
     usuario: models.Usuario = Depends(get_current_user),
 ):
-    _exigir_piloto(usuario)
+    _exigir_piloto(usuario, db)
 
     clave_norm = _normalizar(usuario.nombre_englobado)
     vacacion = (
