@@ -861,10 +861,13 @@ def _meses(inicio: date, fin: date) -> set:
     return {(inicio.year, inicio.month), (fin.year, fin.month)}
 
 
-def validar_fechas_vacaciones(inicio: date, fin: date, tu: bool) -> None:
-    """Maximo de dias seguidos y dias bloqueados. `tu`: mensajes para la propia persona."""
+def validar_fechas_vacaciones(inicio: date, fin: date, tu: bool, con_bloqueos: bool = True) -> None:
+    """Maximo de dias seguidos y dias bloqueados. `tu`: mensajes para la propia persona.
+    `con_bloqueos=False` solo para el admin (POST /vacaciones): registra en periodo de ventas."""
     if (fin - inicio).days + 1 > MAX_DIAS_SEGUIDOS:
         raise HTTPException(status_code=400, detail=f"Máximo {MAX_DIAS_SEGUIDOS} días por solicitud. Si necesitas más días, habla con Gerencia.")
+    if not con_bloqueos:
+        return
     for n in range((fin - inicio).days + 1):
         d = inicio + timedelta(days=n)
         if _dia_bloqueado(d):
@@ -1307,13 +1310,14 @@ def crear_vacacion(
     if body.fecha_fin < body.fecha_inicio:
         raise HTTPException(status_code=400, detail="fecha_fin no puede ser anterior a fecha_inicio")
 
-    # Admin no tiene la regla de anticipacion (puede capturar fechas cercanas o
-    # pasadas), pero si: maximo de dias, bloqueos, uno por mes, 15 dias y saldo.
-    # Las faltas injustificadas siguen sin reglas.
+    # Admin no tiene anticipacion ni bloqueos (7 dic - 7 ene, 13 - 16 nov): puede capturar
+    # fechas cercanas, pasadas o en periodo de ventas. Si sigue: maximo de dias, uno por mes,
+    # 15 dias y saldo (FIFO / 18 meses). Las faltas injustificadas siguen sin reglas.
+    # Los empleados piden por POST /mi-perfil/vacaciones, que conserva todas las reglas.
     es_vacacion = body.tipo == "vacaciones"
     es_extra = body.tipo == "dia_extra"
     if es_vacacion:
-        validar_fechas_vacaciones(body.fecha_inicio, body.fecha_fin, tu=False)
+        validar_fechas_vacaciones(body.fecha_inicio, body.fecha_fin, tu=False, con_bloqueos=False)
     if es_extra:
         # Admin: cualquier fecha dentro de la vigencia (sin anticipación ni bloqueos), días enteros
         validar_dias_enteros(body.fecha_inicio, body.fecha_fin, body.dias)
