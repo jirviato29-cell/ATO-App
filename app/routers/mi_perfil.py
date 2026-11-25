@@ -26,6 +26,7 @@ from app.routers.vacaciones import (
     serializar_con_dias,
     _usuario_activo,
     candado_persona,
+    dia_extra_solo_fin_semana,
     dias_extra_de,
     periodos_guardados,
     saldo_actual_y_siguiente,
@@ -263,7 +264,7 @@ def mis_dias_extra(
     englobado = (usuario.nombre_englobado or "").strip()
     if not englobado:
         return {"clave": "", "dias_disponibles": 0, "vence": None, "dias_usados": 0, "dias_pendientes": 0, "otorgados": []}
-    return dias_extra_de(db, englobado)
+    return {**dias_extra_de(db, englobado), "solo_fin_semana": dia_extra_solo_fin_semana(db, englobado)}
 
 
 # ------------------- ¿Quién te cubre? (lista para elegir) -------------------
@@ -434,8 +435,8 @@ def pedir_vacaciones(
     hoy = datetime.now(ZONA_MX).date()
     es_extra = body.tipo == "dia_extra"
     if es_extra:
-        # 5 días de anticipación, cualquier día de la semana, sin 15 dic - 6 ene
-        validar_fechas_dia_extra_empleado(inicio, fin, hoy)
+        # 7 días de anticipación, sin 7 dic - 7 ene; en RO, M2, DR, M1 y VL solo sábado o domingo
+        validar_fechas_dia_extra_empleado(inicio, fin, hoy, dia_extra_solo_fin_semana(db, clave_norm))
         if not (body.cubre_clave or "").strip() and not body.sin_cubre and body.cubre_por_dia is None:
             raise HTTPException(
                 status_code=400,

@@ -198,6 +198,8 @@ class DiaExtraOtorgado(BaseModel):
 
 class DiasExtraResponse(BaseModel):
     clave: str
+    # Solo en /mi-perfil/dias-extra: su módulo pide el día extra solo en sábado o domingo
+    solo_fin_semana: bool = False
     # Lo que todavía puede pedir: otorgados vigentes menos lo ya pedido o tomado
     dias_disponibles: int
     # Vencimiento más cercano de los días disponibles (null si no hay)
@@ -960,12 +962,33 @@ def periodos_guardados(db: Session, clave_norm: str) -> List[models.Vacacion]:
 # de 6 días seguidos junto con vacaciones.
 
 # Empleado: el día extra se pide con 7 días de anticipación (primer día = hoy + 7),
-# cualquier día de la semana, y nunca del 15 de diciembre al 6 de enero (cada año).
+# y nunca del 7 de diciembre al 7 de enero (cada año, todos los módulos y Cadenas).
 DIAS_ANTICIPACION_EXTRA = 7
+MENSAJE_BLOQUEO_EXTRA = "Del 7 de diciembre al 7 de enero no se pueden pedir días extra."
+
+# Módulos donde el día extra solo se pide en sábado o domingo: RO, M2, DR (Juana) y
+# M1, VL (Zury). Solo para asesores: cuenta el módulo y el rol de la cuenta PRINCIPAL
+# de la persona (las encargadas, Juana y Zury, piden cualquier día).
+MODULOS_DIA_EXTRA_FIN_SEMANA = ["RO", "M2", "DR", "M1", "VL"]
+MENSAJE_FIN_SEMANA_EXTRA = "En tu módulo el día extra solo se puede pedir en sábado o domingo."
 
 
 def dia_extra_bloqueado(d: date) -> bool:
-    return (d.month == 12 and d.day >= 15) or (d.month == 1 and d.day <= 6)
+    return (d.month == 12 and d.day >= 7) or (d.month == 1 and d.day <= 7)
+
+
+def dia_extra_solo_fin_semana(db: Session, clave: str) -> bool:
+    """¿La cuenta principal de la persona es de asesor y de un módulo de MODULOS_DIA_EXTRA_FIN_SEMANA?"""
+    clave_norm = _normalizar(clave)
+    if not clave_norm:
+        return False
+    principal = _principal(_cuentas_por_clave(db, [clave_norm]).get(clave_norm, []))
+    return (
+        principal is not None
+        and principal.rol == models.RolEnum.asesor
+        and principal.modulo is not None
+        and principal.modulo.nombre in MODULOS_DIA_EXTRA_FIN_SEMANA
+    )
 
 
 # Tipos que se suman para el máximo de días seguidos
@@ -1129,8 +1152,9 @@ def validar_dias_extra(
     )
 
 
-def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date) -> None:
-    """Empleado: 7 días de anticipación, de lunes a domingo, sin 15 dic - 6 ene.
+def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date, solo_fin_semana: bool = False) -> None:
+    """Empleado: 7 días de anticipación, sin 7 dic - 7 ene y, si `solo_fin_semana`
+    (módulos de MODULOS_DIA_EXTRA_FIN_SEMANA), solo sábado o domingo.
     La vigencia (festivo a vencimiento) la revisa validar_dias_extra."""
     primer_dia = hoy + timedelta(days=DIAS_ANTICIPACION_EXTRA)
     if inicio < primer_dia:
@@ -1143,10 +1167,9 @@ def validar_fechas_dia_extra_empleado(inicio: date, fin: date, hoy: date) -> Non
         )
     for d in _rango(inicio, fin):
         if dia_extra_bloqueado(d):
-            raise HTTPException(
-                status_code=400,
-                detail=f"El {_texto_fecha(d)} está bloqueado (15 dic - 6 ene): no se pueden pedir días extra",
-            )
+            raise HTTPException(status_code=400, detail=MENSAJE_BLOQUEO_EXTRA)
+    if solo_fin_semana and any(d.weekday() < 5 for d in _rango(inicio, fin)):
+        raise HTTPException(status_code=400, detail=MENSAJE_FIN_SEMANA_EXTRA)
 
 
 @router.get("/dias-extra", response_model=DiasExtraResponse)
