@@ -233,6 +233,57 @@ def marcar_aviso_leido(
     return aviso
 
 
+# Borrar avisos: solo admin y solo de la bandeja de administración (para_clave NULL).
+# Nunca avisos de un empleado ni los de cobertura (CONFIRMO / NO PUEDO). Solo se borra
+# el aviso: la solicitud de vacaciones o el día extra no cambian.
+TIPOS_AVISO_NO_BORRABLES = ("cubrir_solicitud",)
+
+
+def _avisos_borrables():
+    return (models.Aviso.para_clave.is_(None), models.Aviso.tipo.notin_(TIPOS_AVISO_NO_BORRABLES))
+
+
+@router.get("/avisos/leidos/total")
+def contar_avisos_leidos(
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(solo_admin_mensajes),
+):
+    n = db.query(func.count(models.Aviso.id)).filter(*_avisos_borrables(), models.Aviso.leido_at.isnot(None)).scalar()
+    return {"total": int(n or 0)}
+
+
+@router.delete("/avisos/leidos")
+def eliminar_avisos_leidos(
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(solo_admin_mensajes),
+):
+    n = (
+        db.query(models.Aviso)
+        .filter(*_avisos_borrables(), models.Aviso.leido_at.isnot(None))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"ok": True, "eliminados": n}
+
+
+@router.delete("/avisos/{aviso_id}")
+def eliminar_aviso(
+    aviso_id: int,
+    db: Session = Depends(get_db),
+    usuario: models.Usuario = Depends(solo_admin_mensajes),
+):
+    # De un empleado, de cobertura o inexistente: misma respuesta
+    n = (
+        db.query(models.Aviso)
+        .filter(models.Aviso.id == aviso_id, *_avisos_borrables())
+        .delete(synchronize_session=False)
+    )
+    if not n:
+        raise HTTPException(status_code=404, detail="Aviso no encontrado")
+    db.commit()
+    return {"ok": True, "eliminado": aviso_id}
+
+
 # ------------------------------- mensajes -------------------------------
 
 def _autores(db: Session, filas: List[models.Mensaje]) -> dict:
