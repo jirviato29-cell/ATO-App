@@ -1233,6 +1233,8 @@ class DiaResumen(BaseModel):
     minutos_comida: int = 0
     salida_comida: Optional[datetime] = None
     regreso_comida: Optional[datetime] = None
+    dentro_de_zona_entrada: Optional[bool] = None
+    dentro_de_zona_salida: Optional[bool] = None
 
 
 class EmpleadoAcumuladoSemanal(BaseModel):
@@ -1247,6 +1249,7 @@ class EmpleadoAcumuladoSemanal(BaseModel):
     jornada_fija: Optional[float] = 0
     sueldo_base: Optional[float] = 0
     descansos: List[str] = []
+    rol: Optional[str] = None
 
 
 class JornadaUpsert(BaseModel):

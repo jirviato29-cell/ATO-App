@@ -558,6 +558,8 @@ def acumulado_semanal(
                         minutos_comida=r.minutos_comida,
                         salida_comida=r.salida_comida,
                         regreso_comida=r.regreso_comida,
+                        dentro_de_zona_entrada=r.dentro_de_zona_entrada,
+                        dentro_de_zona_salida=r.dentro_de_zona_salida,
                     )
                     total_horas += r.horas_trabajadas
                 else:
@@ -583,6 +585,7 @@ def acumulado_semanal(
                 jornada_fija=float(emp.jornada_fija) if emp.jornada_fija is not None else 0.0,
                 sueldo_base=float(emp.sueldo_base) if emp.sueldo_base is not None else 0.0,
                 descansos=sorted(descansos_por_grupo.get(grupo_de.get(emp.id, ""), set())),
+                rol=getattr(emp.rol, "value", emp.rol),
             ))
 
         return resultado
