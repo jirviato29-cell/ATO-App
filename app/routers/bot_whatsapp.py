@@ -51,6 +51,8 @@ GRAPH_URL = "https://graph.facebook.com/v22.0"
 ESPERA_AGRUPAR_SEG = 8      # espera para juntar varios mensajes seguidos del cliente
 MAX_HISTORIAL = 40          # mensajes que se le pasan a Claude
 MODELO_DEFAULT = "claude-haiku-4-5"
+MAX_LETRAS = 250            # largo que se le pide al modelo
+MAX_LETRAS_DURO = 300       # si se pasa de esto se le pide reescribir y, si no, se recorta
 
 IMAGENES_PLANES = {
     "libre_400": "img_libre_400",
@@ -387,7 +389,51 @@ def _prompt_sistema(cfg: dict, paso: int, datos: dict, equipos: str = "") -> str
         f"Paso actual: {paso}\n"
         f"Datos que ya dio: {json.dumps(datos, ensure_ascii=False)}"
     )
+    partes.append(RECORDATORIO_FINAL)
     return "\n\n".join(partes)
+
+
+RECORDATORIO_FINAL = (
+    "## Recuerda antes de contestar\n"
+    f"Un solo mensaje, máximo {MAX_LETRAS} letras y 3 renglones, una sola pregunta al final. "
+    "No repitas lo que ya dijiste en la plática."
+)
+
+
+def _recortar(texto: str, limite: int = MAX_LETRAS_DURO) -> str:
+    """Ultimo recurso si el modelo se pasa de largo: corta por oraciones y conserva la pregunta final."""
+    texto = (texto or "").strip()
+    if len(texto) <= limite:
+        return texto
+    import re
+    oraciones = [o.strip() for o in re.split(r"(?<=[.!?])\s+|\n+", texto) if o.strip()]
+    pregunta = next((o for o in reversed(oraciones) if o.endswith("?")), "")
+    cuerpo = [o for o in oraciones if o != pregunta]
+    salida = ""
+    for o in cuerpo:
+        prueba = (salida + " " + o).strip()
+        if len(prueba) + len(pregunta) + 1 > limite:
+            break
+        salida = prueba
+    resultado = (salida + " " + pregunta).strip()
+    if not resultado:
+        resultado = texto[:limite].rsplit(" ", 1)[0]
+    return resultado
+
+
+def _llamar_claude(cliente, cfg, system, historial):
+    resp = cliente.messages.create(
+        model=cfg.get("modelo") or MODELO_DEFAULT,
+        max_tokens=700,
+        system=system,
+        tools=[TOOL_RESPONDER],
+        tool_choice={"type": "tool", "name": "responder"},
+        messages=historial,
+    )
+    for bloque in resp.content:
+        if getattr(bloque, "type", None) == "tool_use" and bloque.name == "responder":
+            return bloque.input
+    return None
 
 
 def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict,
@@ -397,18 +443,30 @@ def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict,
         log.error("Falta BOT_ANTHROPIC_API_KEY")
         return None
     cliente = anthropic.Anthropic(api_key=api_key, timeout=60)
-    resp = cliente.messages.create(
-        model=cfg.get("modelo") or MODELO_DEFAULT,
-        max_tokens=1000,
-        system=_prompt_sistema(cfg, paso, datos, equipos),
-        tools=[TOOL_RESPONDER],
-        tool_choice={"type": "tool", "name": "responder"},
-        messages=historial,
-    )
-    for bloque in resp.content:
-        if getattr(bloque, "type", None) == "tool_use" and bloque.name == "responder":
-            return bloque.input
-    return None
+    system = _prompt_sistema(cfg, paso, datos, equipos)
+    resultado = _llamar_claude(cliente, cfg, system, historial)
+    if not resultado:
+        return None
+    mensajes = [m for m in (resultado.get("mensajes") or []) if m and m.strip()]
+    if mensajes and (len(mensajes) > 1 or len(mensajes[0]) > MAX_LETRAS_DURO):
+        # Se paso de largo: se le pide una sola vez que lo reescriba mas corto.
+        largo = " ".join(mensajes)
+        reintento = historial + [
+            {"role": "assistant", "content": f"(borrador demasiado largo) {largo}"},
+            {"role": "user", "content": (
+                f"[Instrucción interna, no la menciones] Tu respuesta tiene {len(largo)} letras. "
+                f"Reescríbela en UN solo mensaje de máximo {MAX_LETRAS} letras, con la misma pregunta final.")},
+        ]
+        try:
+            corto = _llamar_claude(cliente, cfg, system, reintento)
+        except Exception:
+            log.exception("[bot-whatsapp] Fallo el reintento para acortar")
+            corto = None
+        if corto and corto.get("mensajes"):
+            resultado["mensajes"] = corto["mensajes"]
+        mensajes = [m for m in (resultado.get("mensajes") or []) if m and m.strip()]
+    resultado["mensajes"] = [_recortar(" ".join(mensajes))] if mensajes else []
+    return resultado
 
 
 # --------------------------------------------------------------------------
