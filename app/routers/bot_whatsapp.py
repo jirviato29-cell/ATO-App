@@ -15,6 +15,13 @@ Variables de entorno (Render):
   BOT_WA_VERIFY_TOKEN     texto que se escribe tambien en Meta al configurar el webhook
   BOT_WA_APP_SECRET       clave secreta de la app (para validar la firma de Meta)
   BOT_ANTHROPIC_API_KEY   clave "ATO Bot Ventas" (si falta, usa ANTHROPIC_API_KEY)
+
+Aviso al asesor (bot_config):
+  aviso_numero      celular personal que recibe el aviso cuando un chat le toca al asesor
+                    (10 digitos). Vacio = sin avisos. Ese numero NO se atiende como cliente.
+  aviso_ultimo_msg  (lo llena el sistema) ultima vez que ese numero escribio al bot; si fue
+                    hace menos de 24 h el aviso va como texto (gratis), si no, con la
+                    plantilla aprobada "aviso_chat_pendiente".
 """
 
 import hashlib
@@ -159,6 +166,132 @@ def enviar_imagen(wa_id: str, url: str) -> Optional[str]:
 
 def marcar_leido(wa_message_id: str) -> None:
     _enviar({"status": "read", "message_id": wa_message_id})
+
+
+# --------------------------------------------------------------------------
+# Aviso al celular del asesor
+# --------------------------------------------------------------------------
+
+PLANTILLA_AVISO = "aviso_chat_pendiente"
+VENTANA_GRATIS_SEG = 23 * 3600          # margen antes de las 24 h de Meta
+SILENCIO_AVISO_SEG = 10 * 60            # no repetir aviso del mismo chat antes de 10 min
+_ULTIMO_AVISO: dict = {}                # conv_id -> time.time() del ultimo aviso
+
+MOTIVOS_AVISO = {
+    "datos_completos": "ya mandó sus datos completos",
+    "credito": "pregunta por su crédito o buró",
+    "promocion": "pide una promoción especial",
+    "precio_o_equipo": "pregunta un precio o equipo que el bot no sabe",
+    "caso_especial": "tiene un caso especial",
+    "persona": "pide hablar con una persona",
+    "fuera_de_zona": "vive fuera de la zona de entrega",
+    "nuevo_mensaje": "te escribió de nuevo",
+}
+
+
+def _diez_digitos(numero: str) -> str:
+    solo = "".join(ch for ch in (numero or "") if ch.isdigit())
+    return solo[-10:]
+
+
+def es_numero_aviso(db, wa_id: str) -> bool:
+    cfg_num = db.execute(text("SELECT valor FROM bot_config WHERE clave = 'aviso_numero'")).scalar()
+    d = _diez_digitos(cfg_num or "")
+    return len(d) == 10 and _diez_digitos(wa_id) == d
+
+
+def _guardar_config(db, clave: str, valor: str) -> None:
+    db.execute(
+        text("""
+            INSERT INTO bot_config (clave, valor, updated_at) VALUES (:k, :v, NOW())
+            ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor, updated_at = NOW()
+        """),
+        {"k": clave, "v": valor},
+    )
+
+
+def registrar_mensaje_de_aviso(wa_id: str, wa_message_id: Optional[str]) -> None:
+    """El asesor escribio al bot desde su celular: abre la ventana de 24 h para avisos gratis."""
+    db = SessionLocal()
+    try:
+        ya_abierta = _ventana_aviso_abierta(_leer_config(db))
+        _guardar_config(db, "aviso_ultimo_msg", str(int(time.time())))
+        _guardar_config(db, "aviso_wa_id", wa_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("[bot-whatsapp] Error al guardar la ventana de avisos")
+        return
+    finally:
+        db.close()
+    if wa_message_id:
+        marcar_leido(wa_message_id)
+    if not ya_abierta:
+        enviar_texto(wa_id, "✅ Listo, los avisos de chats pendientes te llegan gratis las próximas 24 horas.")
+
+
+def _ventana_aviso_abierta(cfg: dict) -> bool:
+    try:
+        return time.time() - int(cfg.get("aviso_ultimo_msg") or 0) < VENTANA_GRATIS_SEG
+    except ValueError:
+        return False
+
+
+def avisar_asesor(conv_id: int, motivo: str) -> None:
+    """Manda WhatsApp al celular del asesor. Nunca truena el flujo del bot."""
+    try:
+        _avisar_asesor(conv_id, motivo)
+    except Exception:
+        log.exception("[bot-whatsapp] Error al avisar al asesor")
+
+
+def _avisar_asesor(conv_id: int, motivo: str) -> None:
+    ahora = time.time()
+    if ahora - _ULTIMO_AVISO.get(conv_id, 0) < SILENCIO_AVISO_SEG:
+        return
+    db = SessionLocal()
+    try:
+        cfg = _leer_config(db)
+        diez = _diez_digitos(cfg.get("aviso_numero") or "")
+        if len(diez) != 10:
+            return
+        conv = db.execute(
+            text("SELECT wa_id, nombre_perfil FROM bot_conversaciones WHERE id = :c"), {"c": conv_id}
+        ).mappings().first()
+        if not conv:
+            return
+    finally:
+        db.close()
+
+    tel = _diez_digitos(conv["wa_id"])
+    tel_fmt = f"{tel[:3]} {tel[3:6]} {tel[6:]}" if len(tel) == 10 else conv["wa_id"]
+    nombre = " ".join((conv["nombre_perfil"] or "").split())[:40]
+    cliente = f"{nombre} ({tel_fmt})" if nombre else tel_fmt
+    texto_motivo = MOTIVOS_AVISO.get(motivo, "necesita asesor")
+    destino = cfg.get("aviso_wa_id") or ("52" + diez)
+    if _diez_digitos(destino) != diez:
+        destino = "52" + diez
+
+    _ULTIMO_AVISO[conv_id] = ahora
+    if _ventana_aviso_abierta(cfg):
+        wid = enviar_texto(destino, f"🔔 Tienes un chat pendiente en ATO.\nCliente: {cliente}\n"
+                                    f"Motivo: {texto_motivo}\nEntra a ATO Sistema → Chats WhatsApp.")
+        if wid:
+            return
+    wid = _enviar({
+        "to": destino,
+        "type": "template",
+        "template": {
+            "name": PLANTILLA_AVISO,
+            "language": {"code": "es_MX"},
+            "components": [{"type": "body", "parameters": [
+                {"type": "text", "text": cliente},
+                {"type": "text", "text": texto_motivo},
+            ]}],
+        },
+    })
+    if not wid:
+        log.error("[bot-whatsapp] No se pudo mandar el aviso al asesor: %s", ULTIMO_ERROR_ENVIO["texto"])
 
 
 def guardar_saliente(db, conv_id: int, wa_message_id: Optional[str], autor: str,
@@ -409,6 +542,8 @@ def responder_si_toca(msg_id: int, wa_message_id: str) -> None:
              "c": conv_id},
         )
         db.commit()
+        if pasar:
+            avisar_asesor(conv_id, motivo)
     except Exception:
         db.rollback()
         log.exception("Error al responder con el bot")
@@ -417,9 +552,34 @@ def responder_si_toca(msg_id: int, wa_message_id: str) -> None:
 
 
 def procesar_entrante(wa_id: str, nombre: Optional[str], msg: dict) -> None:
+    db = SessionLocal()
+    try:
+        del_asesor = es_numero_aviso(db, wa_id)
+    except Exception:
+        log.exception("[bot-whatsapp] Error al revisar el numero de avisos")
+        del_asesor = False
+    finally:
+        db.close()
+    if del_asesor:
+        registrar_mensaje_de_aviso(wa_id, msg.get("id"))
+        return
+
     msg_id = registrar_entrante(wa_id, nombre, msg)
-    if msg_id:
-        responder_si_toca(msg_id, msg.get("id"))
+    if not msg_id:
+        return
+    db = SessionLocal()
+    try:
+        conv = db.execute(
+            text("""SELECT c.id, c.estado FROM bot_conversaciones c
+                    JOIN bot_mensajes m ON m.conversacion_id = c.id WHERE m.id = :m"""),
+            {"m": msg_id},
+        ).mappings().first()
+    finally:
+        db.close()
+    if conv and conv["estado"] == "asesor":
+        avisar_asesor(conv["id"], "nuevo_mensaje")
+        return
+    responder_si_toca(msg_id, msg.get("id"))
 
 
 def actualizar_estado(status: dict) -> None:
