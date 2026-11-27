@@ -473,6 +473,82 @@ def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict,
 # Proceso de un mensaje entrante (corre en segundo plano)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Candado: el bot solo pasa "datos completos" si de verdad estan todos
+# --------------------------------------------------------------------------
+
+NOMBRES_FALTANTES = {
+    "ine": "la foto de tu INE por ambos lados",
+    "correo": "tu correo electrónico",
+    "tel_casa": "un teléfono de casa (si no tienes, el celular de un familiar)",
+    "tel_trabajo": "un teléfono de trabajo",
+    "referencia_1": "dos referencias personales con nombre completo y teléfono",
+    "referencia_2": "el nombre completo y teléfono de tu segunda referencia",
+}
+
+
+def _tiene_telefono(valor) -> bool:
+    return len("".join(ch for ch in str(valor or "") if ch.isdigit())) >= 10
+
+
+def _tiene_correo(valor) -> bool:
+    v = str(valor or "").strip()
+    return "@" in v and "." in v.split("@")[-1] and " " not in v
+
+
+def faltantes_para_cotizacion(datos: dict, fotos: int) -> list:
+    falta = []
+    if max(fotos, int(datos.get("fotos_ine") or 0)) < 2:
+        falta.append("ine")
+    if not _tiene_correo(datos.get("correo")):
+        falta.append("correo")
+    if not _tiene_telefono(datos.get("tel_casa")):
+        falta.append("tel_casa")
+    if not _tiene_telefono(datos.get("tel_trabajo")):
+        falta.append("tel_trabajo")
+    r1, r2 = _tiene_telefono(datos.get("referencia_1")), _tiene_telefono(datos.get("referencia_2"))
+    if not r1 and not r2:
+        falta.append("referencia_1")
+    elif not (r1 and r2):
+        falta.append("referencia_2")
+    return falta
+
+
+def _mensaje_faltantes(falta: list) -> str:
+    partes = [NOMBRES_FALTANTES[f] for f in falta]
+    if len(partes) == 1:
+        lista = partes[0]
+    else:
+        lista = ", ".join(partes[:-1]) + " y " + partes[-1]
+    return f"¡Gracias! 😊 Para tu cotización solo me falta {lista}. ¿Me lo pasas?"
+
+
+def _validar_datos_completos(db, conv_id: int, datos: dict, resultado: dict) -> dict:
+    """Si el modelo dice datos_completos pero falta algo, no se pasa al asesor y se pide lo que falta."""
+    if not (resultado.get("pasar_a_asesor") and resultado.get("motivo") == "datos_completos"):
+        return resultado
+    nuevos = {k: v for k, v in (resultado.get("datos") or {}).items() if v not in (None, "")}
+    juntos = {**(datos or {}), **nuevos}
+    fotos = db.execute(
+        text("""SELECT COUNT(*) FROM bot_mensajes WHERE conversacion_id = :c
+                AND direccion = 'entrante' AND tipo IN ('image', 'document')"""),
+        {"c": conv_id},
+    ).scalar() or 0
+    falta = faltantes_para_cotizacion(juntos, int(fotos))
+    if not falta:
+        return resultado
+    log.info("[bot-whatsapp] Conv %s: el bot quiso pasar datos completos pero falta %s", conv_id, falta)
+    corregido = dict(resultado)
+    corregido.update({
+        "mensajes": [_mensaje_faltantes(falta)],
+        "pasar_a_asesor": False,
+        "motivo": "ninguno",
+        "paso": 4,
+        "imagen_planes": "ninguna",
+    })
+    return corregido
+
+
 def registrar_entrante(wa_id: str, nombre: Optional[str], msg: dict) -> Optional[int]:
     """Guarda el mensaje. Regresa el id de la fila nueva, o None si ya existia."""
     wa_message_id = msg.get("id")
@@ -562,6 +638,7 @@ def responder_si_toca(msg_id: int, wa_message_id: str) -> None:
         resultado = pedir_respuesta_a_claude(cfg, historial, fila["paso"], datos, equipos)
         if not resultado:
             return
+        resultado = _validar_datos_completos(db, conv_id, datos, resultado)
 
         marcar_leido(wa_message_id)
 
