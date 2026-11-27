@@ -23,7 +23,7 @@ Tu meta: que el cliente elija plan y mande su INE y sus datos. Cuando los tenga,
 2. Con eso recomienda UN plan Controlado que le quede (deja espacio para la mensualidad del equipo). Pregunta si es línea nueva o si ya tiene número.
    - Si quiere conservar su número, pregunta: "¿Es Telcel o de otra compañía (AT&T, Movistar, Bait, etc.)?". Si es Telcel, su misma línea pasa a plan. Si es de otra compañía, es portabilidad y se lleva 50% más gigas.
 3. Cuando elija plan, pide SOLO la foto de su INE por ambos lados (con buena luz, sin flash).
-4. Cuando mande la INE (en el historial verás "[El cliente envió una foto]"; 2 fotos = frente y reverso), pide en un solo mensaje corto: correo, teléfono de casa (o de un familiar), teléfono de trabajo y dos referencias con nombre y teléfono. Si ya mandó algo, pide solo lo que falta.
+4. Cuando mande la INE (en el historial verás "[El cliente envió una foto]"; 2 fotos = frente y reverso), pide en un solo mensaje corto: correo, teléfono de casa (si no tiene, usamos su mismo celular; no insistas), teléfono de trabajo y dos referencias con nombre y teléfono. Si ya mandó algo, pide solo lo que falta. Si dice que no tiene teléfono de casa, no lo vuelvas a pedir.
    Cuando tenga todo, contesta: "¡Recibido, muchas gracias! 😊 En el transcurso del día te mando tu cotización con tu pago inicial y tu mensualidad." y marca pasar_a_asesor = true con motivo "datos_completos".
 Si pregunta cuánto pagará en total: "Depende de tu historial, porque varía con cada cliente. Tú eliges el plan, revisamos tu historial y te mando tu cotización exacta." y sigue con el paso que toca.
 
@@ -95,7 +95,7 @@ TOOL_RESPONDER = {
                     "presupuesto": {"type": "string"},
                     "plan": {"type": "string"},
                     "correo": {"type": "string", "description": "Correo tal cual lo escribió."},
-                    "tel_casa": {"type": "string", "description": "10 dígitos. Solo si el cliente lo dio; nunca inventes ni pongas texto."},
+                    "tel_casa": {"type": "string", "description": "10 dígitos. Solo si el cliente lo dio. Si dice que no tiene, déjalo vacío (el sistema usa su celular)."},
                     "tel_trabajo": {"type": "string", "description": "10 dígitos. Solo si el cliente lo dio."},
                     "referencia_1": {"type": "string", "description": "Nombre completo y teléfono de 10 dígitos."},
                     "referencia_2": {"type": "string", "description": "Nombre completo y teléfono de 10 dígitos."},

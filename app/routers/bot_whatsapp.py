@@ -480,7 +480,7 @@ def pedir_respuesta_a_claude(cfg: dict, historial: list, paso: int, datos: dict,
 NOMBRES_FALTANTES = {
     "ine": "la foto de tu INE por ambos lados",
     "correo": "tu correo electrónico",
-    "tel_casa": "un teléfono de casa (si no tienes, el celular de un familiar)",
+    "tel_casa": "un teléfono de casa",
     "tel_trabajo": "un teléfono de trabajo",
     "referencia_1": "dos referencias personales con nombre completo y teléfono",
     "referencia_2": "el nombre completo y teléfono de tu segunda referencia",
@@ -497,13 +497,12 @@ def _tiene_correo(valor) -> bool:
 
 
 def faltantes_para_cotizacion(datos: dict, fotos: int) -> list:
+    """El telefono de casa no se exige: si falta, se usa el celular del cliente (ver _validar_datos_completos)."""
     falta = []
     if max(fotos, int(datos.get("fotos_ine") or 0)) < 2:
         falta.append("ine")
     if not _tiene_correo(datos.get("correo")):
         falta.append("correo")
-    if not _tiene_telefono(datos.get("tel_casa")):
-        falta.append("tel_casa")
     if not _tiene_telefono(datos.get("tel_trabajo")):
         falta.append("tel_trabajo")
     r1, r2 = _tiene_telefono(datos.get("referencia_1")), _tiene_telefono(datos.get("referencia_2"))
@@ -536,6 +535,13 @@ def _validar_datos_completos(db, conv_id: int, datos: dict, resultado: dict) -> 
     ).scalar() or 0
     falta = faltantes_para_cotizacion(juntos, int(fotos))
     if not falta:
+        if not _tiene_telefono(juntos.get("tel_casa")):
+            # Sin telefono de casa: se usa el celular del cliente (indicacion de Josue).
+            wa = db.execute(text("SELECT wa_id FROM bot_conversaciones WHERE id = :c"), {"c": conv_id}).scalar()
+            cel = "".join(ch for ch in str(wa or "") if ch.isdigit())[-10:]
+            if len(cel) == 10:
+                resultado = dict(resultado)
+                resultado["datos"] = {**(resultado.get("datos") or {}), "tel_casa": f"{cel} (su celular)"}
         return resultado
     log.info("[bot-whatsapp] Conv %s: el bot quiso pasar datos completos pero falta %s", conv_id, falta)
     corregido = dict(resultado)
