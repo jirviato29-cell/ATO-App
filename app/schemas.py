@@ -76,6 +76,8 @@ class AsistenciaResumenDia(BaseModel):
     puede_registrar_comida: bool = False
     foto_salida_comida_url: Optional[str] = None
     foto_regreso_comida_url: Optional[str] = None
+    dentro_de_zona_salida_comida: Optional[bool] = None
+    dentro_de_zona_regreso_comida: Optional[bool] = None
 
 
 class JustificacionCreate(BaseModel):
@@ -1235,6 +1237,8 @@ class DiaResumen(BaseModel):
     regreso_comida: Optional[datetime] = None
     dentro_de_zona_entrada: Optional[bool] = None
     dentro_de_zona_salida: Optional[bool] = None
+    dentro_de_zona_salida_comida: Optional[bool] = None
+    dentro_de_zona_regreso_comida: Optional[bool] = None
 
 
 class EmpleadoAcumuladoSemanal(BaseModel):

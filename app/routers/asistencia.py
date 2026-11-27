@@ -134,6 +134,8 @@ def _agrupar(
             puede_registrar_comida=puede_registrar_comida,
             foto_salida_comida_url=sal_com.foto_url if sal_com else None,
             foto_regreso_comida_url=reg_com.foto_url if reg_com else None,
+            dentro_de_zona_salida_comida=sal_com.dentro_de_zona if sal_com else None,
+            dentro_de_zona_regreso_comida=reg_com.dentro_de_zona if reg_com else None,
         ))
     return resultado
 
@@ -560,6 +562,8 @@ def acumulado_semanal(
                         regreso_comida=r.regreso_comida,
                         dentro_de_zona_entrada=r.dentro_de_zona_entrada,
                         dentro_de_zona_salida=r.dentro_de_zona_salida,
+                        dentro_de_zona_salida_comida=r.dentro_de_zona_salida_comida,
+                        dentro_de_zona_regreso_comida=r.dentro_de_zona_regreso_comida,
                     )
                     total_horas += r.horas_trabajadas
                 else:
