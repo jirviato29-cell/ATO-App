@@ -195,6 +195,7 @@ class UsuarioCreate(BaseModel):
     asegurado: Optional[bool] = None
     whatsapp: Optional[str] = Field(None, max_length=15)
     foto_url: Optional[str] = None
+    talla: Optional[str] = Field(None, max_length=10)
 
 # 👉 Este es para actualizar un usuario
 class UsuarioUpdate(BaseModel):

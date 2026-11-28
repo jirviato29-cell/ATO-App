@@ -109,6 +109,7 @@ def registrar_usuario(
             asegurado=bool(usuario.asegurado),
             whatsapp=usuario.whatsapp or None,
             foto_url=usuario.foto_url or None,
+            talla=(usuario.talla or None),
         )
         db.add(usuario_nuevo)
         db.commit()
